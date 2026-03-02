@@ -112,6 +112,7 @@ def build_terramesh_dataset(
     :param probs: List of probabilities for each subset (majortom and ssl4eos12). Defaults to [0.8, 0.2].
     :return: WebDataset (single modality) or DataPipeline (multiple modalities)
     """
+    
     if len(modalities) == 1:
         # Single modality
         modalities = modalities[0]
@@ -319,6 +320,7 @@ def build_multimodal_dataset(
         partial: bool = False,
         probs: list[int] = None,
 ):
+    print(f"Building dataset with modalities {modalities} and split {split} from {path}.")
     if modalities is None:
         modalities = ["S2L2A", "S2L1C", "S2RGB", "S1GRD", "S1RTC", "DEM", "NDVI", "LULC"]  # Default
     if urls is None:
@@ -354,7 +356,7 @@ def build_multimodal_dataset(
     dataset = wds.RandomMix([ds_mt, ds_ssl], probs=probs or [0.8, 0.2],
                             longest=not shardshuffle  # Load all samples if shuffle is false
                             )
-
+    print(f"Finished building dataset with modalities {modalities} and split {split} from {path}.") 
     return dataset
 
 
@@ -550,21 +552,32 @@ class MultimodalTransforms:
         return data
 
 
-class MultimodalNormalize(Callable):
+class MultimodalNormalize(albumentations.BasicTransform):
     def __init__(self, mean: dict[str, list[float]], std: dict[str, list[float]]):
-        super().__init__()
+        super().__init__(p=1)
         self.mean = mean
         self.std = std
 
-    def __call__(self, **batch):
+    def __call__(self, *args, force_apply=False, **data):
         for m in self.mean.keys():
-            if m not in batch.keys():
+            if m not in data:
                 continue
-            batch[m] = (batch[m] - self.mean[m]) / self.std[m]
-        return batch
+            data[m] = (data[m] - np.array(self.mean[m], dtype=np.float32)) / np.array(self.std[m], dtype=np.float32)
+        return data
+
+    def apply(self, img, **params):
+        return img
+
+    @property
+    def targets(self):
+        return {"image": self.apply}
+
+    @property
+    def available_keys(self):
+        return set(self.mean.keys()) | {"image"}
+
+    def get_transform_init_args_names(self):
+        return ("mean", "std")
 
     def add_targets(self, targets):
-        """
-        Required by albumentations
-        """
         pass
