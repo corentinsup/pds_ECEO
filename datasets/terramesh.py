@@ -319,10 +319,9 @@ def build_multimodal_dataset(
         time_dim: bool = True,
         partial: bool = False,
         probs: list[int] = None,
-):
-    print(f"Building dataset with modalities {modalities} and split {split} from {path}.")
-    if modalities is None:
-        modalities = ["S2L2A", "S2L1C", "S2RGB", "S1GRD", "S1RTC", "DEM", "NDVI", "LULC"]  # Default
+        ):
+    
+    modalities = ["S2L2A", "S2L1C", "S2RGB", "S1GRD", "S1RTC", "DEM", "NDVI", "LULC"]  # Default
     if urls is None:
         # Filter modalities based availability (S1GRD and S1RTC not present in all subsets)
         def filter_list(lst, value):
@@ -334,8 +333,8 @@ def build_multimodal_dataset(
 
         urls_majortom = os.path.join(path, split, f"[{','.join(filter_list(modalities, 'S1GRD'))}]",
                                      split_files["majortom"][split][0])
-        urls_ssl4eos12 = os.path.join(path, split, f"[{','.join(filter_list(modalities, 'S1RTC'))}]",
-                                      split_files["ssl4eos12"][split][0])
+        '''urls_ssl4eos12 = os.path.join(path, split, f"[{','.join(filter_list(modalities, 'S1RTC'))}]",
+                                      split_files["ssl4eos12"][split][0])'''
     else:
         if "::" in urls:
             urls_majortom, urls_ssl4eos12 = urls.split("::")
@@ -347,16 +346,18 @@ def build_multimodal_dataset(
                               return_metadata=return_metadata, transform=transform,
                               time_dim=time_dim, partial=partial)
 
-    ds_ssl = _subset_pipeline(urls_ssl4eos12, batch_size=batch_size, shardshuffle=shardshuffle,
+    '''ds_ssl = _subset_pipeline(urls_ssl4eos12, batch_size=batch_size, shardshuffle=shardshuffle,
                               deterministic=deterministic, seed=seed, empty_check=empty_check,
                               return_metadata=return_metadata, transform=transform,
-                              time_dim=time_dim, partial=partial)
+                              time_dim=time_dim, partial=partial)'''
 
-    # mix batches (never mixes samples)
+    '''# mix batches (never mixes samples)
     dataset = wds.RandomMix([ds_mt, ds_ssl], probs=probs or [0.8, 0.2],
                             longest=not shardshuffle  # Load all samples if shuffle is false
-                            )
-    print(f"Finished building dataset with modalities {modalities} and split {split} from {path}.") 
+                            )'''
+    # no need to mix since we completely remove S1GRD
+    dataset = ds_mt
+    
     return dataset
 
 
@@ -562,7 +563,13 @@ class MultimodalNormalize(albumentations.BasicTransform):
         for m in self.mean.keys():
             if m not in data:
                 continue
-            data[m] = (data[m] - np.array(self.mean[m], dtype=np.float32)) / np.array(self.std[m], dtype=np.float32)
+            mean_arr = np.array(self.mean[m], dtype=np.float32)
+            std_arr = np.array(self.std[m], dtype=np.float32)
+            if data[m].ndim == 3 and data[m].shape[0] == mean_arr.shape[0]:
+                # Channel-first (C, H, W): reshape for broadcasting
+                mean_arr = mean_arr.reshape(-1, 1, 1)
+                std_arr = std_arr.reshape(-1, 1, 1)
+            data[m] = (data[m] - mean_arr) / std_arr
         return data
 
     def apply(self, img, **params):
@@ -581,3 +588,17 @@ class MultimodalNormalize(albumentations.BasicTransform):
 
     def add_targets(self, targets):
         pass
+'''
+
+class MultimodalNormalize(albumentations.ImageOnlyTransform):
+    def __init__(self, mean: dict[str, list[float]], std: dict[str, list[float]]):
+        super().__init__()
+        self.mean = mean
+        self.std = std
+
+    def __call__(self, **batch):
+        for m in self.mean.keys():
+            if m not in batch.keys():
+                continue
+            batch[m] = (batch[m] - self.mean[m]) / self.std[m]
+        return batch'''
