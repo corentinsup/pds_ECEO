@@ -34,7 +34,7 @@ def train_epoch(modalities):
         spectrum_specs="electromagnetic_spectrum.yaml",  # Load spectrum specs as needed
         patch_size=16,
         masking_ratio=(0.6, 1.0)
-        
+
     )
 
     # Set batch size to None because batching is handled by WebDataset.
@@ -42,13 +42,15 @@ def train_epoch(modalities):
 
     # Iterate over the dataloader
     counter = 0
-    for images, marker_indices, mask in dataloader:
+    for images, marker_indices, mask, projection_indices in dataloader:
         # images:         [B, C_total, H, W]  – all modality bands concatenated
-        # marker_indices:
+        # marker_indices: [C_total] – indices of the marker embeddings
         # mask:           [B, C_total, Hg, Wg] – patch-level boolean mask (Hg = H // patch_size)
+        # projection_indices: [B, max_channels, nb_patch_length, nb_patch_length] – tiled projection indices
         print("Images shape:        ", images.shape)
         print("Marker indices:      ", marker_indices)
         print("Mask shape:          ", mask.shape)
+        print("Projection indices shape: ", projection_indices.shape)
         counter+=1
         if counter >= 4:  # Just check the first batches
             break
