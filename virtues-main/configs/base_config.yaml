@@ -1,19 +1,18 @@
 
-datasets_config: null # Path to dataset config file
+dataset_path: '../../data/corentin/data/TerraMesh' # Path to dataset
 
 experiments_dir: null # Outputs will be written to {experiments_dir}/{experiment.name}/
-marker_embedding_dir: null # Directory containing marker embeddings as .pt files
 
 experiment:
   name: null # Initialize with the name of the run
   seed: 42
   wandb_entity: null
   wandb_project: null
-  wandb_mode: online # "online", "offline", or "disabled"
+  wandb_mode: disabled # "online", "offline", or "disabled"
 
 training:
   epochs: 100
-  batch_size: 16
+  batch_size: 8
   fp16: True
   bf16: False
   num_workers: 10
@@ -25,13 +24,13 @@ training:
   disable_eval: false
 
 model:
-  patch_size: 8
+  patch_size: 16
   model_dim: 512
   feedforward_dim: 1024
-  encoder_pattern: hvhvhvhvhvhvhvhv
-  num_encoder_heads: 8
-  decoder_pattern: ffff
-  num_decoder_heads: 8
+  encoder_pattern: hvhv
+  num_encoder_heads: 4
+  decoder_pattern: ff
+  num_decoder_heads: 2
   num_decoder_hidden_layers: 0
   positional_embedding_type: rope
   dropout: 0.0
@@ -39,6 +38,18 @@ model:
   norm_after_encoder_decoder: True
 
 data:
-  crop_size: 128
+  crop_size: 224
   masking_ratio: [0.6, 1.0]
-  channel_fraction: [0.75, 1.0]
+  modalities:
+  - "S2L2A"
+  - "S2L1C"
+  - "S1RTC"
+  shuffle: True
+  channels_file: 'assets/channels.csv'
+  return_metadata: False
+  shardshuffle: 100
+  deterministric: False
+  time_dim: False
+  partial: False
+  probs: null
+

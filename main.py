@@ -24,14 +24,16 @@ def train_epoch(modalities):
     )
 
     dataset = TerraMeshDataset(
-        path='../../data/corentin/data/TerraMesh',  # Streaming or local path
-        modalities=modalities, 
-        shuffle=True,  # Set false for split="val"
-        split="val",
+        path="'../../data/corentin/data/TerraMesh'",
+        modalities=modalities,
+        shuffle=True,  
+        split= "val",
         transform=train_transform,
         batch_size=8,
-        marker_embedding_dir=os.path.join(os.path.dirname(__file__), 'assets/marker_embeddings'),
-        channels_file=os.path.join(os.path.dirname(__file__), 'assets/channels.csv')
+        sensor_specs="pretraining_sensors.yaml",  # Load sensor specs as needed
+        spectrum_specs="electromagnetic_spectrum.yaml",  # Load spectrum specs as needed
+        patch_size=16,
+        masking_ratio=(0.6, 1.0)
         
     )
 

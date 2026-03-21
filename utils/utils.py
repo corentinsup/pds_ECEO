@@ -2,6 +2,8 @@ import os
 import torch
 import numpy as np
 import random
+import yaml
+from typing import Tuple
 
 def is_rank0():
     """
@@ -21,23 +23,22 @@ def set_seed(seed : int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-def load_marker_embedding_dict(embedding_dir : str):
+def load_specs(sensors_specs_path : str, spectrum_specs_path : str):
     """
-    Returns a dictionary mapping protein IDs to their index in the marker embedding matrix of `load_marker_embeddings`.
-    embedding_dir: directory containing marker embeddings in .pt format
+    Loads sensor and spectrum specifications from YAML files.
+    sensors_specs_path: path to the YAML file containing sensor specifications
+    spectrum_specs_path: path to the YAML file containing spectrum specifications
+    Returns a tuple of (sensors_specs, spectrum_specs).
     """
-    embedding_dict = {}
-    if not os.path.exists(embedding_dir):
-        raise ValueError(f"Could not find embedding_dir {embedding_dir}")
-    files = os.listdir(embedding_dir)
-    files = list(sorted(files))
-    index = 0
-    for file in files:
-        if file.endswith(".pt"):
-            protein_id = file.removesuffix(".pt")
-            embedding_dict[protein_id] = index
-            index += 1
-    return embedding_dict
+    if not os.path.exists(sensors_specs_path):
+        raise ValueError(f"Could not find sensors_specs_path {sensors_specs_path}")
+    with open(sensors_specs_path) as f:
+        sensors_specs = yaml.safe_load(f.read())
+    if not os.path.exists(spectrum_specs_path):
+        raise ValueError(f"Could not find spectrum_specs_path {spectrum_specs_path}")
+    with open(spectrum_specs_path) as f:
+        spectrum_specs = yaml.safe_load(f.read())
+    return (sensors_specs, spectrum_specs)
 
 def load_marker_embeddings(embedding_dir : str):
     """
@@ -70,4 +71,62 @@ def to_device(x, device):
         return None
     else:
         return x.to(device)
+
+def get_selected_bands_mask(config: dict, sensor_names: list[str] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Creates a boolean mask for selected bands based on sensor configuration.
     
+    Parameters
+    ----------
+    config : dict
+        Sensor configuration dictionary loaded from YAML
+    sensor_names : list[str], optional
+        List of sensor names to include. If None, all sensors in config are used.
+    
+    Returns
+    -------
+    torch.Tensor
+        Boolean mask of shape (total_bands,) where True indicates a band is selected.
+    torch.Tensor
+        Tensor of shape (num_selected_bands,) containing the indices of selected channels.
+    """
+    if sensor_names is None:
+        sensor_names = list(config.keys())
+    
+    total_mask = []
+    band_offset = 0
+    channel_indices = []  # List to store the indices of selected channels for each sensor
+    
+    for sensor_name in sensor_names:
+        if sensor_name not in config:
+            print(f"Warning: {sensor_name} not found in config")
+            continue
+            
+        sensor_config = config[sensor_name]
+        num_bands = len(sensor_config['bands'])
+        selected_indices = sensor_config['selected_bands']
+        
+        # Create mask for this sensor and keep track of the indices for each sensor 
+        sensor_mask = [False] * num_bands
+        for idx in selected_indices:
+            if 0 <= idx < num_bands:
+                sensor_mask[idx] = True
+                channel_indices.append(band_offset + idx)  # Store the global index of the selected channel
+        
+        total_mask.extend(sensor_mask)
+        band_offset += num_bands
+
+    return (torch.tensor(total_mask, dtype=torch.bool), torch.tensor(channel_indices, dtype=torch.long))
+
+'''   
+def set_specs(args):
+    with open(args.eval_specs_path) as f:
+        eval_ds = yaml.safe_load(f.read())
+    args.eval_specs = eval_ds
+    with open(args.sensors_specs_path) as f:
+        sensors_specs = yaml.safe_load(f.read())
+    args.sensors_specs = sensors_specs  # save on args so that it's prop'd to wandb
+    with open(args.spectrum_specs_path) as f:
+        spectrum_specs = yaml.safe_load(f.read())
+    args.spectrum_specs = spectrum_specs
+    '''

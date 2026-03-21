@@ -4,6 +4,7 @@ from loguru import logger
 from modules.layers.transformers_flashattention import MarkerAttentionEncoderBlock, ChannelAttentionEncoderBlock, FullAttentionEncoderBlock, PatchAttentionBlock
 from modules.layers.mask_utils_flashattention import build_self_attention_bias, build_self_attention_bias_channel_concat, SELF_ATTENTION_BIAS_CACHE
 from modules.layers.positional_embeddings import LearnablePositionalEmbedding2D, PositionalEmbedding2D, RotaryPositionalEmbedding2D
+from utils.model_utils import SpectrumAwareProjection
 from einops import rearrange
 from itertools import groupby 
 from typing import Iterator, Optional, List, Tuple, Dict, Any, overload
@@ -11,25 +12,26 @@ from dataclasses import dataclass
 from modules.layers.basic_modules import build_activation
 
 @dataclass
-class MultiplexEncoderOutput:
+class TerraMeshViTEncoderOutput:
     encoded_multiplex: List[torch.Tensor]  # List of encoded multiplex tensors, one per input multiplex
     patch_summary_tokens: List[torch.Tensor]  # List of patch summary tokens, one per input multiplex
 
 @dataclass 
-class MultiplexDecoderOutput:
+class TerraMeshViTDecoderOutput:
     decoded_multiplex: Tuple[torch.Tensor]  # List of decoded multiplex tensors, one per input multiplex
 
 @dataclass
-class MultiplexVirtuesOutput:
+class TerraMeshViTOutput:
     decoded_multiplex: Tuple[torch.Tensor]  # List of decoded multiplex tensors, one per input multiplex
     patch_summary: List[torch.Tensor]  # List of patch summary tokens, one per input multiplex
     channel_token_embeddings: Optional[List[torch.Tensor]] = None  # Optional list of channel token embeddings
 
-class MultiplexVirtuesEncoder(nn.Module):
+class TerraMeshViTEncoder(nn.Module):
     def __init__(
             self,
+            spectrum_specs: Dict[str, Any],
             prior_bias_embeddings: torch.Tensor,
-            prior_bias_embedding_type: str,
+            prior_bias_embedding_type: Optional[str],
             patch_size: int,
             model_dim: int,
             feedforward_dim: int,
@@ -60,17 +62,28 @@ class MultiplexVirtuesEncoder(nn.Module):
 
         self.use_prior_embedding = self.prior_bias_embedding_type != 'empty'
         if self.use_prior_embedding:
-            assert prior_bias_embeddings is not None, "prior_bias_embeddings must be provided if prior_bias_embedding_type is not 'empty'"
+            #assert prior_bias_embeddings is not None, "prior_bias_embeddings must be provided if prior_bias_embedding_type is not 'empty'"
             if self.prior_bias_embedding_type == 'learnable':
                 self.prior_bias_embeddings = nn.Parameter(self.prior_bias_embeddings)
             elif self.prior_bias_embedding_type == 'zero':
                 self.prior_bias_embeddings = nn.Parameter(torch.zeros_like(self.prior_bias_embeddings))
+            elif self.prior_bias_embedding_type == 'wl':
+                # Initialization of wavelength embeddings with sinusoidal positional embeddings
+                self.spectrum_projection = SpectrumAwareProjection(
+                    spectrum_specs=spectrum_specs, 
+                    patch_size=self.patch_size, 
+                    embed_dim=self.model_dim
+                )
             else:
                 self.register_buffer('prior_bias_embeddings', prior_bias_embeddings, persistent=False)
+        
 
         if self.prior_bias_embedding_fusion_type == 'add':
             if self.verbose:
                 print("Using addition for prior_embedding fusion")
+        elif self.prior_bias_embedding_fusion_type == 'concatenate':
+            if self.verbose:
+                print("Using concatenation followed by linear layer for prior_embedding fusion")    
         elif self.prior_bias_embedding_fusion_type == 'cross-attn':
             raise NotImplementedError("Cross-attention fusion not implemented yet") # @EJ
         
@@ -93,7 +106,9 @@ class MultiplexVirtuesEncoder(nn.Module):
         self.masked_token = nn.Parameter(torch.randn(self.model_dim) / self.model_dim**power) # type: ignore
 
         self.patch_encoder = nn.Linear(self.patch_size * self.patch_size, self.model_dim)
-        self.prior_embedding_encoder = nn.Linear(self.prior_bias_embeddings.shape[1], self.model_dim) if self.use_prior_embedding else None 
+        #self.prior_embedding_encoder = nn.Linear(self.prior_bias_embeddings.shape[1], self.model_dim) if self.use_prior_embedding else None 
+        self.prior_embedding_linear = nn.Linear(self.model_dim * 2, self.model_dim) if self.use_prior_embedding and self.prior_bias_embedding_fusion_type == 'concatenate' else None
+
         # forming encoder
         enc_layers = []
         if group_layers:
@@ -156,7 +171,8 @@ class MultiplexVirtuesEncoder(nn.Module):
     def forward_list(self, multiplex: List[torch.Tensor],
                      channel_ids: List[torch.Tensor],
                      multiplex_mask: Optional[List[torch.Tensor]] = None,
-    ) -> MultiplexEncoderOutput:
+    ) -> TerraMeshViTEncoderOutput:
+        
         B = len(multiplex)
         h, w = multiplex[0].shape[-2], multiplex[0].shape[-1]
         H, W = h // self.patch_size, w // self.patch_size
@@ -164,7 +180,7 @@ class MultiplexVirtuesEncoder(nn.Module):
         multiplex_channels_per_sample = [len(ch) for ch in channel_ids]
         multiplex = [(
             rearrange(mx_i, 'C (H p) (W q) -> C H W (p q)', p=self.patch_size, q=self.patch_size)
-        ) for mx_i in multiplex]
+        ) for mx_i in multiplex] # List[(C_i) H W (p q)]
         cat_multiplex = torch.cat(multiplex, dim=0)  # (sum_C) H W (p q)
         cat_channel_ids = torch.cat(channel_ids, dim=0)  # (sum_C)
         if multiplex_mask is not None:
@@ -188,7 +204,6 @@ class MultiplexVirtuesEncoder(nn.Module):
 
         cat_multiplex = self.patch_encoder(cat_multiplex)  # (sum_C) (H W) model_dim
 
-
         if multiplex_mask is not None:
            cat_multiplex = torch.where(cat_multiplex_mask.unsqueeze(-1),
                                        self.masked_token.expand(cat_multiplex.shape),
@@ -197,15 +212,20 @@ class MultiplexVirtuesEncoder(nn.Module):
 
         cat_multiplex = rearrange(cat_multiplex, "C H W D -> C (H W) D")
 
-
         if self.use_prior_embedding:
-            prior_embeddings = self.prior_bias_embeddings[cat_channel_ids]  # (sum_C) D
+            '''prior_embeddings = self.prior_bias_embeddings[cat_channel_ids]  # (sum_C) D
             prior_embeddings = self.prior_embedding_encoder(prior_embeddings)  # (sum_C) model_dim
-            prior_embeddings = prior_embeddings.unsqueeze(1).expand(*cat_multiplex.shape)  # (sum_C) (H W) model_dim
+            prior_embeddings = prior_embeddings.unsqueeze(1).expand(*cat_multiplex.shape)  # (sum_C) (H W) model_dim'''
+            img_spectrum_embeds = torch.zeros((B, h, w, self.model_dim), device=cat_multiplex.device)       
+            for projection_idx in torch.unbind(torch.)  
             if self.prior_bias_embedding_fusion_type == 'add':
                 cat_multiplex = cat_multiplex + prior_embeddings
+            elif self.prior_bias_embedding_fusion_type == 'concatenate':
+                cat_multiplex = torch.cat([cat_multiplex, prior_embeddings], dim=-1)  # (sum_C) (H W) 2*model_dim
+                cat_multiplex = self.prior_embedding_linear(cat_multiplex)  # (sum_C) (H W) model_dim
             else:
                 raise NotImplementedError("Cross-attention fusion not implemented yet") # @EJ
+            
 
         
         cat_multiplex = torch.split(cat_multiplex, multiplex_channels_per_sample, dim=0)  # List[(C_i) (H W) D]
@@ -269,13 +289,13 @@ class MultiplexVirtuesEncoder(nn.Module):
         ps = [x_i[0] for x_i in x]  # List[(H W) D]
         x = [x_i[1+self.num_registers:] for x_i in x]  # List[(C_i) H W D]
 
-        return MultiplexEncoderOutput(
+        return TerraMeshViTEncoderOutput(
             encoded_multiplex=x,
             patch_summary_tokens=ps,
         )
     
 
-class MultiplexVirtuesDecoder(nn.Module):
+class TerraMeshViTDecoder(nn.Module):
     def __init__(self,
                  patch_size: int,
                  model_dim: int,
@@ -372,7 +392,7 @@ class MultiplexVirtuesDecoder(nn.Module):
     def forward_list(self, x: List[torch.Tensor], 
                      patch_summary_tokens: List[torch.Tensor],
                      x_channels_per_sample: List[int],
-                     ) -> MultiplexDecoderOutput:
+                     ) -> TerraMeshViTDecoderOutput:
         H, W, D = x[0].shape[-3], x[0].shape[-2], x[0].shape[-1]
         x_copy = torch.empty(
             sum(x_channels_per_sample), 2, H , W, D,
@@ -418,7 +438,7 @@ class MultiplexVirtuesDecoder(nn.Module):
         multiplex = rearrange(multiplex, "(C) (H W) (p q) -> C (H p) (W q)", H=H, W=W, p=self.patch_size, q=self.patch_size)
         multiplex = torch.split(multiplex, x_channels_per_sample, dim=0)  # List[(C_i) (H p) (W q)]
 
-        return MultiplexDecoderOutput(
+        return TerraMeshViTDecoderOutput(
             decoded_multiplex=multiplex,
         )
 
@@ -442,11 +462,11 @@ class MultiplexVirtuesDecoder(nn.Module):
 
 
 
-class MultiplexVirtues(nn.Module):
+class TerraMeshViT(nn.Module):
 
-    VALID_PRIOR_BIAS_EMBEDDING_TYPES = {'zero', 'learnable', 'esm', 'esm_learnable', 'one_hot', 'empty'}
+    VALID_PRIOR_BIAS_EMBEDDING_TYPES = {'zero', 'learnable', 'wl', 'dem', 'one_hot', 'empty'}
     VALID_PATTERN_BLOCKS = {'h', 'v', 'f', 'p'}
-    VALID_PRIOR_BIAS_EMBEDDING_FUSION_TYPES = {'add', 'cross-attn'}
+    VALID_PRIOR_BIAS_EMBEDDING_FUSION_TYPES = {'add', 'cross-attn', 'concatenate'}
     VALID_POSITIONAL_EMBEDDING_TYPES = {'learnable', 'absolute_beginning', 'rope'}
     def __init__(self,
                  use_default_config: bool,
@@ -509,7 +529,7 @@ class MultiplexVirtues(nn.Module):
         self._check_config_params()
     
 
-        self.encoder = MultiplexVirtuesEncoder(
+        self.encoder = TerraMeshViTEncoder(
             prior_bias_embeddings=prior_bias_embeddings,
             prior_bias_embedding_type=prior_bias_embedding_type,
             patch_size=patch_size,
@@ -525,7 +545,7 @@ class MultiplexVirtues(nn.Module):
             **kwargs
         )
 
-        self.decoder = MultiplexVirtuesDecoder(
+        self.decoder = TerraMeshViTDecoder(
             patch_size=patch_size,
             model_dim=model_dim,
             feedforward_dim=feedforward_dim,
@@ -543,7 +563,7 @@ class MultiplexVirtues(nn.Module):
                 multiplex: List[torch.Tensor],
                 channel_ids: List[torch.Tensor],
                 multiplex_mask: Optional[List[torch.Tensor]] = None,
-    ) -> MultiplexVirtuesOutput:
+    ) -> TerraMeshViTOutput:
         mx_channels_per_sample = [len(ch) for ch in channel_ids]
         encoder_output = self.encoder.forward_list(
             multiplex,
@@ -555,7 +575,7 @@ class MultiplexVirtues(nn.Module):
             encoder_output.patch_summary_tokens,
             mx_channels_per_sample,
         )
-        return MultiplexVirtuesOutput(
+        return TerraMeshViTOutput(
             decoded_multiplex=decoder_output.decoded_multiplex,
             patch_summary=encoder_output.patch_summary_tokens,
             channel_token_embeddings=encoder_output.encoded_multiplex
