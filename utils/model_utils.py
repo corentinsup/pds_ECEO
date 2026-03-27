@@ -79,7 +79,9 @@ class SpectrumAwareProjection(nn.Module):
                         embed_dim))
                 
     def forward(self, x, projection_idx):
-        return self.spectrum_embeds[projection_idx](x)
+        if isinstance(projection_idx, torch.Tensor):
+            projection_idx = int(projection_idx.item())
+        return self.spectrum_embeds[int(projection_idx)](x)
 
 # --------------------------------------------------------
 # 2D sine-cosine position embedding

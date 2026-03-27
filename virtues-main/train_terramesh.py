@@ -1,10 +1,18 @@
 import os
+import sys
+from pathlib import Path
 import torch
 import wandb
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from omegaconf import OmegaConf
 from transformers import Trainer, TrainingArguments
+
+# Allow running this file as a script: python virtues-main/train_terramesh.py
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from datasets.terramesh import Transpose, MultimodalTransforms, MultimodalNormalize, statistics
 from datasets.terramesh_dataset import TerraMeshDataset
 from utils.utils import is_rank0, set_seed, to_device, load_specs
@@ -18,16 +26,20 @@ class TerraMeshViTTrainer(Trainer):
         self.conf = conf
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        multiplex, channel_ids, multiplex_mask = inputs
+        multiplex, channel_ids, multiplex_mask, sensor_ids, projection_indices = inputs
         
         multiplex = to_device(multiplex, 'cuda') # list of tensors of shape C_i x H x W
         channel_ids = to_device(channel_ids, 'cuda') # list of tensors of shape C_i
         multiplex_mask = to_device(multiplex_mask, 'cuda') # list of tensors of shape C_i x H//patch_size x W//patch_size
+        sensor_ids = to_device(sensor_ids, 'cuda') # list of tensors of shape C_i
+        projection_indices = to_device(projection_indices, 'cuda') # list of tensors of shape max_channels x nb_patch_length x nb_patch_length
 
         outputs = model.forward(
                             multiplex=multiplex,
                             channel_ids=channel_ids,
-                            multiplex_mask=multiplex_mask
+                            multiplex_mask=multiplex_mask,
+                            sensor_ids=sensor_ids,
+                            projection_indices=projection_indices
                         )
         
         reconstructions = outputs.decoded_multiplex # list of tensors of shape C_i x H x W
@@ -73,7 +85,20 @@ def train_virtues(conf):
     Trains VirTues according to the provided configuration.
     """
     sensor_specs, spectrum_specs = load_specs(conf.sensors_specs_path, conf.spectrum_specs_path)
+    # Filter the sensor and spectrum specs to only include the sensors specified in the config
+    sensor_specs = {k: v for k, v in sensor_specs.items() if v['sensor_idx'] in conf.data.sensors}
+    
+    # Build remap from old ids to contiguous [0..N-1]
+    selected_old_ids = sorted({v["sensor_idx"] for v in sensor_specs.values()})
+    old_to_new = {old_id: new_id for new_id, old_id in enumerate(selected_old_ids)}
 
+    # Apply remap in-place (or on a copied dict)
+    for k in sensor_specs:
+        sensor_specs[k]["sensor_idx"] = old_to_new[sensor_specs[k]["sensor_idx"]]
+    print(sensor_specs)
+    num_sensors = len(conf.data.sensors) 
+    print(f"Using {num_sensors} sensors for training: {conf.data.sensors}")
+   
     # Define multimodal transform function that converts the data into the expected shape from albumentations
     transforms = MultimodalTransforms(
         transforms=A.Compose([
@@ -93,11 +118,13 @@ def train_virtues(conf):
     train_dataset = TerraMeshDataset(
         path=conf.dataset_path,
         modalities=conf.data.modalities,
-        shuffle=conf.data.shuffle,  
-        split= "train",
-        transform=transforms,
-        batch_size=conf.training.batch_size,
         sensor_specs=sensor_specs,
+        spectrum_specs=spectrum_specs,
+        shuffle=conf.data.shuffle,  
+        split= "val",
+        transform=transforms,
+        seed=conf.experiment.seed,
+        batch_size=conf.training.batch_size,
         patch_size=conf.model.patch_size,
         masking_ratio=tuple(conf.data.masking_ratio)
     )
@@ -105,25 +132,57 @@ def train_virtues(conf):
     test_dataset = TerraMeshDataset(
         path=conf.dataset_path,
         modalities=conf.data.modalities,
-        shuffle=conf.data.shuffle,  # Set false for split="val"
-        split= "test",
-        transform=transforms, # No data augmentation for test set
-        batch_size=conf.training.batch_size,
         sensor_specs=sensor_specs,
+        spectrum_specs=spectrum_specs,
+        shuffle=conf.data.shuffle,  
+        split= "val",
+        transform=transforms,
+        seed=conf.experiment.seed,
+        batch_size=conf.training.batch_size,
         patch_size=conf.model.patch_size,
         masking_ratio=tuple(conf.data.masking_ratio)
     )
 
     def custom_collate_fn(batch):
-        multiplex = [sample[0] for sample in batch]
-        channel_ids = [sample[1] for sample in batch]
-        multiplex_mask = [sample[2] for sample in batch]
-        return multiplex, channel_ids, multiplex_mask
+        # if C is fixed, Webdataset returns a stacked tensor; otherwise, it returns a list.
+        sample = batch[0]  # unpack the DataLoader wrapper
+        multiplex, channel_ids, multiplex_mask, sensor_ids, projection_indices = sample
+
+        # Handle both stacked tensor (fixed C) and list (variable C)
+        if isinstance(multiplex, torch.Tensor):
+            # Shape: (B, C, H, W)
+            # Unbind along batch dim → List[Tensor(C, H, W)]
+            multiplex          = list(multiplex.unbind(0))           # List[Tensor(C, H, W)]
+            channel_ids        = list(channel_ids.unbind(0))         # List[Tensor(C,)]
+            multiplex_mask     = list(multiplex_mask.unbind(0))      # List[Tensor(C, Hg, Wg)]
+            sensor_ids         = list(sensor_ids.unbind(0))          # List[Tensor(C,)]
+            projection_indices = list(projection_indices.unbind(0))  # List[Tensor(C, Hg, Wg)]
+        else:
+            # Already a list
+            multiplex          = [mx.contiguous() for mx in multiplex]
+            channel_ids        = [ch.contiguous() for ch in channel_ids]
+            multiplex_mask     = [mx.contiguous() for mx in multiplex_mask]
+            sensor_ids         = [s.contiguous() for s in sensor_ids]
+            projection_indices = [p.contiguous() for p in projection_indices]
+
+        # .contiguous() on the stacked case too
+        multiplex          = [mx.contiguous() for mx in multiplex]
+        multiplex_mask     = [mx.contiguous() for mx in multiplex_mask]
+
+        assert all(mx.ndim == 3 for mx in multiplex), \
+            f"Expected (C, H, W) tensors, got shapes: {[mx.shape for mx in multiplex]}"
+        assert all(ch.ndim == 1 for ch in channel_ids), \
+            f"Expected 1D channel_ids, got shapes: {[ch.shape for ch in channel_ids]}"
+        assert len(multiplex) == len(channel_ids) == len(sensor_ids) == len(projection_indices), \
+            "Mismatch in batch size across fields"
+
+        return multiplex, channel_ids, multiplex_mask, sensor_ids, projection_indices
 
     model = TerraMeshViT(
         use_default_config = False,
         custom_config = None,
         spectrum_specs=spectrum_specs,
+        num_sensors=num_sensors,
         prior_bias_embedding_type='wl',
         prior_bias_embedding_fusion_type='concatenate',
         patch_size=conf.model.patch_size,
@@ -145,8 +204,7 @@ def train_virtues(conf):
     training_args = TrainingArguments(
         output_dir=os.path.join(conf.experiments_dir, conf.experiment.name, 'checkpoints'),
         num_train_epochs=conf.training.epochs,
-        #per_device_train_batch_size=conf.training.batch_size,
-        #per_device_eval_batch_size=conf.training.batch_size,
+        max_steps=conf.training.max_steps if conf.training.max_steps > 0 else None,
         per_device_train_batch_size=1,  # We set batch size to 1 because we handle batching in the dataset with WebDataset
         per_device_eval_batch_size=1,
         eval_strategy="epoch" if not DISABLE_EVAL else "no",
@@ -182,7 +240,7 @@ def train_virtues(conf):
 
 
 if __name__ == "__main__":
-    conf = OmegaConf.load("configs/base_config.yaml")
+    conf = OmegaConf.load("pds_ECEO/virtues-main/configs/base_config.yaml")
     cli_conf = OmegaConf.from_cli()
     if hasattr(cli_conf, 'datasets_config') and cli_conf.datasets_config is not None:
         dataset_conf = OmegaConf.load(cli_conf.datasets_config)
@@ -223,6 +281,12 @@ if __name__ == "__main__":
     if os.environ.get('LOCAL_RANK', None) is not None:
         local_rank = int(os.environ['LOCAL_RANK'])
         torch.cuda.set_device(local_rank)
+    
+    # Force torch to use specific GPU if specified in the config
+    if conf.experiment.gpu is not None:
+        CUDA_VISIBLE_DEVICES = str(conf.experiment.gpu)
+        os.environ["CUDA_VISIBLE_DEVICES"] = CUDA_VISIBLE_DEVICES
+        print(f"Using GPU {conf.experiment.gpu} for training.")
 
     DISABLE_EVAL = conf.training.disable_eval
     if DISABLE_EVAL and is_rank0():

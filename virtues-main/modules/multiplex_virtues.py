@@ -33,6 +33,7 @@ class TerraMeshViTEncoder(nn.Module):
             prior_bias_embeddings: torch.Tensor,
             prior_bias_embedding_type: Optional[str],
             patch_size: int,
+            num_sensors: int,
             model_dim: int,
             feedforward_dim: int,
             encoder_pattern: str,
@@ -68,12 +69,17 @@ class TerraMeshViTEncoder(nn.Module):
             elif self.prior_bias_embedding_type == 'zero':
                 self.prior_bias_embeddings = nn.Parameter(torch.zeros_like(self.prior_bias_embeddings))
             elif self.prior_bias_embedding_type == 'wl':
-                # Initialization of wavelength embeddings with sinusoidal positional embeddings
+                # Initialization of Spectrum-aware learnable embeddings based on the wavelength of each channel, 
+                # which will be added to the patch embeddings
                 self.spectrum_projection = SpectrumAwareProjection(
                     spectrum_specs=spectrum_specs, 
                     patch_size=self.patch_size, 
                     embed_dim=self.model_dim
                 )
+
+                # Creation of learnable embeddings for each sensor, which will be added to the wavelength embeddings
+                self.num_sensors = num_sensors
+                self.sensor_embeddings = nn.Embedding(self.num_sensors, self.model_dim)
             else:
                 self.register_buffer('prior_bias_embeddings', prior_bias_embeddings, persistent=False)
         
@@ -171,18 +177,74 @@ class TerraMeshViTEncoder(nn.Module):
     def forward_list(self, multiplex: List[torch.Tensor],
                      channel_ids: List[torch.Tensor],
                      multiplex_mask: Optional[List[torch.Tensor]] = None,
+                     sensor_ids: Optional[List[torch.Tensor]] = None,
+                     projection_indices: Optional[torch.Tensor | List[torch.Tensor]] = None,
     ) -> TerraMeshViTEncoderOutput:
         
-        B = len(multiplex)
+        B = len(multiplex) # number of samples in the batch, i.e. number of multiplexes
         h, w = multiplex[0].shape[-2], multiplex[0].shape[-1]
-        H, W = h // self.patch_size, w // self.patch_size
+        H, W = h // self.patch_size, w // self.patch_size # Number of patches along height and width
         
-        multiplex_channels_per_sample = [len(ch) for ch in channel_ids]
+        multiplex_channels_per_sample = [len(ch) for ch in channel_ids] # should be the sum of all channels across modalities for each sample, i.e. C_i for each sample i
         multiplex = [(
             rearrange(mx_i, 'C (H p) (W q) -> C H W (p q)', p=self.patch_size, q=self.patch_size)
         ) for mx_i in multiplex] # List[(C_i) H W (p q)]
         cat_multiplex = torch.cat(multiplex, dim=0)  # (sum_C) H W (p q)
         cat_channel_ids = torch.cat(channel_ids, dim=0)  # (sum_C)
+        sensor_embeds = None
+        
+        # Sensor Embeddings 
+        if sensor_ids is not None and self.use_prior_embedding:
+            cat_sensor_ids = torch.cat(sensor_ids, dim=0).long() # (sum_C)
+            print("cat_sensor_ids:", cat_sensor_ids)
+            if torch.any(cat_sensor_ids < 0) or torch.any(cat_sensor_ids >= self.num_sensors):
+                bad_min = int(cat_sensor_ids.min().item())
+                bad_max = int(cat_sensor_ids.max().item())
+                raise ValueError(
+                    f"sensor_ids out of range for embedding: min={bad_min}, max={bad_max}, num_sensors={self.num_sensors}"
+                )
+            sensor_embeds = self.sensor_embeddings(cat_sensor_ids) # (sum_C) D
+            sensor_embeds = sensor_embeds.unsqueeze(1).expand(-1, H*W, -1).clone()  # (sum_C) (H W) D
+
+        # Wavelength-based Spectrum-aware Embeddings
+        if projection_indices is not None:
+            cat_proj_indices = torch.cat(projection_indices, dim=0)  # (sum_C) H W
+
+            # proj_idx is spatially constant per channel → take the value at the first spatial position for each channel
+            flat_proj_indices = cat_proj_indices[:, 0, 0].long()  # (sum_C_per_sample)
+            
+            # flat_proj_indices: (sum_C,) — broadcast spatially
+            spatial_proj = flat_proj_indices[:, None, None].expand(-1, H, W).clone()  # (sum_C, H, W)
+
+            # Now apply spectrum projection patch by patch
+            # cat_multiplex: (sum_C, H, W, p*q)
+            # we need output: (sum_C, H, W, D)
+            patch_embeds = None
+            
+            for proj_idx in torch.unique(spatial_proj):
+                mask = (spatial_proj == proj_idx)                    # (sum_C, H, W) bool
+                patches = cat_multiplex[mask]                        # (N_match, P²)
+                proj_out = self.spectrum_projection(patches, proj_idx.item())
+                if patch_embeds is None:
+                    patch_embeds = torch.zeros(
+                        (cat_multiplex.shape[0], H, W, self.model_dim),
+                        device=cat_multiplex.device,
+                        dtype=proj_out.dtype,
+                    )
+                patch_embeds[mask] = proj_out.to(dtype=patch_embeds.dtype)
+
+            if patch_embeds is None:
+                patch_embeds = torch.zeros(
+                    (cat_multiplex.shape[0], H, W, self.model_dim),
+                    device=cat_multiplex.device,
+                    dtype=cat_multiplex.dtype,
+                )
+
+            cat_multiplex = patch_embeds  # (sum_C, H, W, D)
+        else:
+            # Fallback: single generic linear projection
+            cat_multiplex = self.patch_encoder(cat_multiplex)  # (sum_C, H, W, D)
+
         if multiplex_mask is not None:
             cat_multiplex_mask = torch.cat(multiplex_mask, dim=0)  # (sum_C) H W
 
@@ -202,8 +264,6 @@ class TerraMeshViTEncoder(nn.Module):
         pos_multiplex = pos_multiplex.expand(sum_C, H, W, 2)
         pos_multiplex = rearrange(pos_multiplex, 'C H W d -> C (H W) d')
 
-        cat_multiplex = self.patch_encoder(cat_multiplex)  # (sum_C) (H W) model_dim
-
         if multiplex_mask is not None:
            cat_multiplex = torch.where(cat_multiplex_mask.unsqueeze(-1),
                                        self.masked_token.expand(cat_multiplex.shape),
@@ -212,21 +272,22 @@ class TerraMeshViTEncoder(nn.Module):
 
         cat_multiplex = rearrange(cat_multiplex, "C H W D -> C (H W) D")
 
-        if self.use_prior_embedding:
-            '''prior_embeddings = self.prior_bias_embeddings[cat_channel_ids]  # (sum_C) D
+        # Concatenate sensor embeddings with cat_multiplex if sensor embeddings are used
+        if sensor_embeds is not None:
+            if self.prior_embedding_linear is not None:
+                cat_multiplex = torch.cat([cat_multiplex, sensor_embeds], dim=-1)  # (sum_C) (H W) 2*D
+                cat_multiplex = self.prior_embedding_linear(cat_multiplex)  # (sum_C) (H W) D
+            else:
+                cat_multiplex = cat_multiplex + sensor_embeds
+
+        '''if self.use_prior_embedding:
+            prior_embeddings = self.prior_bias_embeddings[cat_channel_ids]  # (sum_C) D
             prior_embeddings = self.prior_embedding_encoder(prior_embeddings)  # (sum_C) model_dim
-            prior_embeddings = prior_embeddings.unsqueeze(1).expand(*cat_multiplex.shape)  # (sum_C) (H W) model_dim'''
-            img_spectrum_embeds = torch.zeros((B, h, w, self.model_dim), device=cat_multiplex.device)       
-            for projection_idx in torch.unbind(torch.)  
+            prior_embeddings = prior_embeddings.unsqueeze(1).expand(*cat_multiplex.shape)  # (sum_C) (H W) model_dim
             if self.prior_bias_embedding_fusion_type == 'add':
                 cat_multiplex = cat_multiplex + prior_embeddings
-            elif self.prior_bias_embedding_fusion_type == 'concatenate':
-                cat_multiplex = torch.cat([cat_multiplex, prior_embeddings], dim=-1)  # (sum_C) (H W) 2*model_dim
-                cat_multiplex = self.prior_embedding_linear(cat_multiplex)  # (sum_C) (H W) model_dim
-            else:
-                raise NotImplementedError("Cross-attention fusion not implemented yet") # @EJ
-            
-
+        else:
+            raise NotImplementedError("Cross-attention fusion not implemented yet") # @EJ'''
         
         cat_multiplex = torch.split(cat_multiplex, multiplex_channels_per_sample, dim=0)  # List[(C_i) (H W) D]
         if self.num_registers > 0:
@@ -563,12 +624,16 @@ class TerraMeshViT(nn.Module):
                 multiplex: List[torch.Tensor],
                 channel_ids: List[torch.Tensor],
                 multiplex_mask: Optional[List[torch.Tensor]] = None,
+                sensor_ids: Optional[List[torch.Tensor]] = None,
+                projection_indices: Optional[torch.Tensor | List[torch.Tensor]] = None,
     ) -> TerraMeshViTOutput:
         mx_channels_per_sample = [len(ch) for ch in channel_ids]
         encoder_output = self.encoder.forward_list(
             multiplex,
             channel_ids,
             multiplex_mask=multiplex_mask,
+            sensor_ids=sensor_ids,
+            projection_indices=projection_indices,
         )
         decoder_output = self.decoder.forward_list(
             encoder_output.encoded_multiplex,

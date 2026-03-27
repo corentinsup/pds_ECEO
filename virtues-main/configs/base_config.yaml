@@ -1,21 +1,25 @@
 
 dataset_path: '../../data/corentin/data/TerraMesh' # Path to dataset
+sensors_specs_path: 'pds_ECEO/config/pretraining_sensors.yaml' # Path to sensors specs file
+spectrum_specs_path: 'pds_ECEO/config/electromagnetic_spectrum.yaml' # Path to spectrum specs file
 
-experiments_dir: null # Outputs will be written to {experiments_dir}/{experiment.name}/
+experiments_dir: 'experiments/' # Outputs will be written to {experiments_dir}/{experiment.name}/
 
 experiment:
-  name: null # Initialize with the name of the run
+  name: first_test # Initialize with the name of the run
   seed: 42
-  wandb_entity: null
-  wandb_project: null
-  wandb_mode: disabled # "online", "offline", or "disabled"
+  gpu: 0 # Set to None to use default GPU selection, or specify a GPU index (e.g., 0, 1, etc.)
+  wandb_entity: corentin-suply-epfl
+  wandb_project: TerraMesh
+  wandb_mode: online # "online", "offline", or "disabled"
 
 training:
   epochs: 100
+  max_steps: 10048 # 80384 / (8 * 1) / 100 epochs ≈ 100 steps/epoch → 10,048 total steps
   batch_size: 8
   fp16: True
   bf16: False
-  num_workers: 10
+  num_workers: 4
   gradient_accumulation_steps: 1
   lr: 0.0002
   lr_scheduler_type: cosine
@@ -26,7 +30,7 @@ training:
 model:
   patch_size: 16
   model_dim: 512
-  feedforward_dim: 1024
+  feedforward_dim: 768
   encoder_pattern: hvhv
   num_encoder_heads: 4
   decoder_pattern: ff
@@ -42,10 +46,10 @@ data:
   masking_ratio: [0.6, 1.0]
   modalities:
   - "S2L2A"
-  - "S2L1C"
+  #- "S2L1C"
   - "S1RTC"
+  sensors: [1, 2] # List of sensor indices to use (as defined in sensors_specs_path)
   shuffle: True
-  channels_file: 'assets/channels.csv'
   return_metadata: False
   shardshuffle: 100
   deterministric: False

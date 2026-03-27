@@ -30,45 +30,39 @@ class TerraMeshDataset(IterableDataset):
         probs: list[int] = None,
         patch_size: int = 16,
         masking_ratio : Tuple[float, float] = (0.6, 1.0),
-        crop_size: int = 224,
-        max_channels: int = 13 # max numbers of channels for any sensor after band selection, used for tiling the projection indices
+        crop_size: int = 224
     ):
-        """
-        image_dir: directory containing full satelite images
-        channels_file: path to csv file containing channel information in the same order as the multiplex images
-        split: split to use (train, test, all)
-        masking_ratio: tuple indicating the range of masking ratios from which per-sample masking ratio is drawn uniformly
-        """
         self.patch_size = patch_size
         self.masking_ratio = masking_ratio
         self.transform = transform
         self.modalities = modalities
         self.nb_patch_length = int(crop_size // self.patch_size)  # Assuming all images are 512x512, this gives the number of patches along one dimension
-        self.max_channels = max_channels
 
         # Init indices 
-        '''self.projection_conversion = {i: spectrum_specs[i]['projection_idx'] for i in spectrum_specs}
-        self.bands = np.array(sensor_specs['bands'])
-        self.selected_band_indices =  np.array(sensor_specs['selected_bands']).astype('int')
-        self.projection_indices = np.array([self.projection_conversion[i] for i in self.bands[self.selected_band_indices]])
-'''
         self.projection_conversion = {i: spectrum_specs[i]['projection_idx'] for i in spectrum_specs}
         # create a dict of sensor_idx to the selected bands for that sensor
         self.bands = {sensor_specs[sensor]['sensor_idx']: np.array(
             sensor_specs[sensor]['bands'])[np.array(sensor_specs[sensor]['selected_bands']).astype('int')] for sensor in sensor_specs}
+        self.max_channels = max(len(bands) for bands in self.bands.values())
         # create a dict of sensor_idx to the projection indices for the selected bands for that sensor
         self.projection_indices = {
             sensor_specs[sensor]['sensor_idx']: np.array(
                 [self.projection_conversion[i] for i in self.bands[sensor_specs[sensor]['sensor_idx']]]) for sensor in sensor_specs}
-    
-
+        
+        self.channel_proj_indices = self._build_channel_proj_indices(sensor_specs)
+        
         # Create a mapping from the selected channels
         self.channel_mask, self.channels_indices = get_selected_bands_mask(sensor_specs)
-        
-        print("channel mask shape:", self.channel_mask.shape)
-        print("channel mask:", self.channel_mask)
-        print("channels indices shape:", self.channels_indices.shape)
-        print("channels indices:", self.channels_indices)
+
+        # Build per-channel sensor ids and filter with the same mask used for channel selection.
+        sensor_ids_per_channel = []
+        for sensor in sensor_specs:
+            sensor_idx = sensor_specs[sensor]['sensor_idx']
+            num_bands = len(sensor_specs[sensor]['bands'])
+            sensor_ids_per_channel.extend([sensor_idx] * num_bands)
+        sensor_ids_per_channel = torch.tensor(sensor_ids_per_channel, dtype=torch.long)
+        self.sensor_indices = sensor_ids_per_channel[self.channel_mask]
+       
         # Build the WebDataset pipeline using the provided build_terramesh_dataset function
         self.dataset = build_terramesh_dataset(
             path=path,
@@ -86,7 +80,22 @@ class TerraMeshDataset(IterableDataset):
             probs=probs,
         )
 
-    def _process(self, sample: dict) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _build_channel_proj_indices(self, sensor_specs):
+        """
+        Build a 1D tensor of projection_idx, one per present channel,
+        in the same order as channels appear after channel_mask is applied.
+        """
+        proj_list = []
+        for sensor in sensor_specs:
+            sensor_idx = sensor_specs[sensor]['sensor_idx']
+            # projection_indices[sensor_idx] already holds the proj_idx
+            # for each selected band of this sensor, in order
+            proj_list.append(self.projection_indices[sensor_idx])
+        
+        # Concatenate across sensors → (C_present,)
+        return torch.tensor(np.concatenate(proj_list), dtype=torch.long)
+
+    def _process(self, sample: dict) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Convert one WebDataset output dict into (images, marker_indices, mask).
 
@@ -97,43 +106,47 @@ class TerraMeshDataset(IterableDataset):
         channel_indices : Tensor [C_total]
         mask : Tensor [C_total, Hg, Wg] or [B, C_total, Hg, Wg]
         """
-
-        # Concanteante all modality bands along the channel axis
-        images = torch.cat([sample[modality] for modality in self.modalities], dim=-3)  #[B, C_total, H, W]
-
-        # apply channel mask to filter out channels without marker embeddings
-        images = images[:, self.channel_mask]  # [B, C_present, H, W]
-
-        channel_indices = self.channels_indices
-
-        # Tile the projection indices to match the number of patches and the number of bands for each sensor 
-        tiled_proj_indices = []
-
-        for sensor_idx in self.projection_indices:
-            proj = self.projection_indices[sensor_idx]                  # shape [nb_band]
-            nb_band = len(proj)
-
-            reps = int(np.ceil(self.max_channels / nb_band))                 # enough repeats
-            tiled = np.tile(
-                proj.reshape(1, 1, -1),
-                (self.nb_patch_length, self.nb_patch_length, reps)
-            ).astype(np.int32)
-
-            tiled = tiled[:, :, :self.max_channels]                          # cap to max_channels
-            tiled_proj_indices.append(tiled)
-
-        tiled_proj_indices = np.concatenate(tiled_proj_indices, axis=-1) # shape [nb_patch_length, nb_patch_length, max_channels * nb_sensors]
-        tiled_proj_indices = torch.as_tensor(np.expand_dims(tiled_proj_indices, axis=0)) # shape [1, nb_patch_length, nb_patch_length, max_channels]
-        tiled_proj_indices = tiled_proj_indices.repeat(images.shape[0], 1, 1, 1).permute(0, 3, 1, 2) # shape [B, max_channels, nb_patch_length, nb_patch_length]
-
-        # Generate mask(s) at patch-grid resolution (batched: [B, C, H, W])
+        # Concatenate & mask channels
+        images = torch.cat([sample[m] for m in self.modalities], dim=-3)  # (B, C_total, H, W)
+        images = images[:, self.channel_mask]                               # (B, C_present, H, W)
         B, C, H, W = images.shape
-        mask = torch.stack(
+
+        # Build proj_indices by broadcasting channel axis spatially
+        # channel_proj_indices: (C_present,)
+        # → (C_present, 1, 1) → (C_present, H//p, W//p) → (B, C_present, H//p, W//p)
+        Hg = H // self.patch_size
+        Wg = W // self.patch_size
+
+        proj_indices = (
+            self.channel_proj_indices          # (C_present,)
+            .view(1, C, 1, 1)                  # (1, C, 1, 1)
+            .expand(B, -1,Hg, Wg)              # (B, C_present, Hg, Wg)
+            .clone()
+            .to(images.device)
+        )
+
+        channel_indices = (
+            self.channels_indices  # (C,)
+            .unsqueeze(0)           # (1, C_present)
+            .expand(B, -1)          # (B, C_present)
+            .clone()
+            .to(images.device)
+        )
+        sensor_indices = (
+            self.sensor_indices # (C,)
+            .unsqueeze(0)       # (1, C_present)
+            .expand(B, -1)      # (B, C_present)
+            .clone()
+            .to(images.device)
+        )
+        
+        # Generate mask at patch-grid resolution (batched: [B, C, H, W])
+        masks = torch.stack(
             [generate_mask(C, H // self.patch_size, W // self.patch_size, self.masking_ratio)
             for _ in range(B)]
             )
         
-        return images, channel_indices, mask, tiled_proj_indices
+        return images, channel_indices, masks, sensor_indices, proj_indices
 
     def __iter__(self):
         """Yield (images, channel_indices, mask) for every sample in the WebDataset pipeline."""
