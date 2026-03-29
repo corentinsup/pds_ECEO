@@ -6,7 +6,7 @@ import os
 from typing import Tuple
 from torch.utils.data import IterableDataset
 #from datasets.virtues_augmentations import MultiplexRandomCrop, MultiplexRandomSymmetry, ChannelDropout
-from datasets.terramesh import build_terramesh_dataset
+from .terramesh import build_terramesh_dataset
 from utils.utils import get_selected_bands_mask
 from utils.masking import generate_mask
 

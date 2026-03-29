@@ -1,5 +1,4 @@
 import os
-import sys
 from pathlib import Path
 import torch
 import wandb
@@ -8,16 +7,11 @@ from albumentations.pytorch import ToTensorV2
 from omegaconf import OmegaConf
 from transformers import Trainer, TrainingArguments
 
-# Allow running this file as a script: python virtues-main/train_terramesh.py
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from datasets.terramesh import Transpose, MultimodalTransforms, MultimodalNormalize, statistics
-from datasets.terramesh_dataset import TerraMeshDataset
+from local_datasets.terramesh import Transpose, MultimodalTransforms, MultimodalNormalize, statistics
+from local_datasets.terramesh_dataset import TerraMeshDataset
 from utils.utils import is_rank0, set_seed, to_device, load_specs
 from utils.positional_encodings import WavelenghtSinusoidalEmbedding, Summer
-from modules.multiplex_virtues import TerraMeshViT
+from virtues.modules.multiplex_virtues import TerraMeshViT
 
 class TerraMeshViTTrainer(Trainer):
 
@@ -240,7 +234,7 @@ def train_virtues(conf):
 
 
 if __name__ == "__main__":
-    conf = OmegaConf.load("pds_ECEO/virtues-main/configs/base_config.yaml")
+    conf = OmegaConf.load("pds_ECEO/virtues/configs/base_config.yaml")
     cli_conf = OmegaConf.from_cli()
     if hasattr(cli_conf, 'datasets_config') and cli_conf.datasets_config is not None:
         dataset_conf = OmegaConf.load(cli_conf.datasets_config)

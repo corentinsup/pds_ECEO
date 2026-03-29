@@ -1,5 +1,5 @@
 
-dataset_path: '../../data/corentin/data/TerraMesh' # Path to dataset
+dataset_path: '../../scratch/izar/suply/dataset/data/data/TerraMesh/' # Path to dataset
 sensors_specs_path: 'pds_ECEO/config/pretraining_sensors.yaml' # Path to sensors specs file
 spectrum_specs_path: 'pds_ECEO/config/electromagnetic_spectrum.yaml' # Path to spectrum specs file
 

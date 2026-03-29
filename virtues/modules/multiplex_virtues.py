@@ -1,15 +1,15 @@
 import torch
 from torch import nn
 from loguru import logger
-from modules.layers.transformers_flashattention import MarkerAttentionEncoderBlock, ChannelAttentionEncoderBlock, FullAttentionEncoderBlock, PatchAttentionBlock
-from modules.layers.mask_utils_flashattention import build_self_attention_bias, build_self_attention_bias_channel_concat, SELF_ATTENTION_BIAS_CACHE
-from modules.layers.positional_embeddings import LearnablePositionalEmbedding2D, PositionalEmbedding2D, RotaryPositionalEmbedding2D
+from .layers.transformers_flashattention import MarkerAttentionEncoderBlock, ChannelAttentionEncoderBlock, FullAttentionEncoderBlock, PatchAttentionBlock
+from .layers.mask_utils_flashattention import build_self_attention_bias, build_self_attention_bias_channel_concat, SELF_ATTENTION_BIAS_CACHE
+from .layers.positional_embeddings import LearnablePositionalEmbedding2D, PositionalEmbedding2D, RotaryPositionalEmbedding2D
 from utils.model_utils import SpectrumAwareProjection
 from einops import rearrange
 from itertools import groupby 
 from typing import Iterator, Optional, List, Tuple, Dict, Any, overload
 from dataclasses import dataclass
-from modules.layers.basic_modules import build_activation
+from .layers.basic_modules import build_activation
 
 @dataclass
 class TerraMeshViTEncoderOutput:
@@ -69,15 +69,13 @@ class TerraMeshViTEncoder(nn.Module):
             elif self.prior_bias_embedding_type == 'zero':
                 self.prior_bias_embeddings = nn.Parameter(torch.zeros_like(self.prior_bias_embeddings))
             elif self.prior_bias_embedding_type == 'wl':
-                # Initialization of Spectrum-aware learnable embeddings based on the wavelength of each channel, 
-                # which will be added to the patch embeddings
+                self.C_max = 11
                 self.spectrum_projection = SpectrumAwareProjection(
                     spectrum_specs=spectrum_specs, 
                     patch_size=self.patch_size, 
                     embed_dim=self.model_dim
                 )
-
-                # Creation of learnable embeddings for each sensor, which will be added to the wavelength embeddings
+                # Creation of learnable embeddings for each sensor
                 self.num_sensors = num_sensors
                 self.sensor_embeddings = nn.Embedding(self.num_sensors, self.model_dim)
             else:
@@ -112,8 +110,8 @@ class TerraMeshViTEncoder(nn.Module):
         self.masked_token = nn.Parameter(torch.randn(self.model_dim) / self.model_dim**power) # type: ignore
 
         self.patch_encoder = nn.Linear(self.patch_size * self.patch_size, self.model_dim)
-        #self.prior_embedding_encoder = nn.Linear(self.prior_bias_embeddings.shape[1], self.model_dim) if self.use_prior_embedding else None 
-        self.prior_embedding_linear = nn.Linear(self.model_dim * 2, self.model_dim) if self.use_prior_embedding and self.prior_bias_embedding_fusion_type == 'concatenate' else None
+        self.prior_embedding_encoder = nn.Linear(self.prior_bias_embeddings.shape[1], self.model_dim) if self.prior_bias_embedding_type != 'wl' else None 
+        self.prior_embedding_linear = nn.Linear(self.model_dim * 2, self.model_dim) if self.use_prior_embedding and self.prior_bias_embedding_type == 'wl' else None
 
         # forming encoder
         enc_layers = []
@@ -210,6 +208,9 @@ class TerraMeshViTEncoder(nn.Module):
         if projection_indices is not None:
             cat_proj_indices = torch.cat(projection_indices, dim=0)  # (sum_C) H W
 
+            scale_factors = torch.tensor([self.Cmax / C_i for C_i in multiplex_channels_per_sample
+                                          for _ in range(C_i)], device=cat_proj_indices.device)  # (sum_C)
+
             # proj_idx is spatially constant per channel → take the value at the first spatial position for each channel
             flat_proj_indices = cat_proj_indices[:, 0, 0].long()  # (sum_C_per_sample)
             
@@ -233,14 +234,7 @@ class TerraMeshViTEncoder(nn.Module):
                     )
                 patch_embeds[mask] = proj_out.to(dtype=patch_embeds.dtype)
 
-            if patch_embeds is None:
-                patch_embeds = torch.zeros(
-                    (cat_multiplex.shape[0], H, W, self.model_dim),
-                    device=cat_multiplex.device,
-                    dtype=cat_multiplex.dtype,
-                )
-
-            cat_multiplex = patch_embeds  # (sum_C, H, W, D)
+            cat_multiplex = patch_embeds*scale_factors[:, None, None, None]  # (sum_C, H, W, D)
         else:
             # Fallback: single generic linear projection
             cat_multiplex = self.patch_encoder(cat_multiplex)  # (sum_C, H, W, D)
@@ -274,13 +268,13 @@ class TerraMeshViTEncoder(nn.Module):
 
         # Concatenate sensor embeddings with cat_multiplex if sensor embeddings are used
         if sensor_embeds is not None:
-            if self.prior_embedding_linear is not None:
+            if self.prior_bias_embedding_fusion_type == 'concatenate':
                 cat_multiplex = torch.cat([cat_multiplex, sensor_embeds], dim=-1)  # (sum_C) (H W) 2*D
                 cat_multiplex = self.prior_embedding_linear(cat_multiplex)  # (sum_C) (H W) D
             else:
                 cat_multiplex = cat_multiplex + sensor_embeds
 
-        '''if self.use_prior_embedding:
+        if self.self.prior_bias_embedding_type != 'wl':
             prior_embeddings = self.prior_bias_embeddings[cat_channel_ids]  # (sum_C) D
             prior_embeddings = self.prior_embedding_encoder(prior_embeddings)  # (sum_C) model_dim
             prior_embeddings = prior_embeddings.unsqueeze(1).expand(*cat_multiplex.shape)  # (sum_C) (H W) model_dim
@@ -652,7 +646,7 @@ class TerraMeshViT(nn.Module):
         
             
     def _set_default_config(self):
-        from modules.configs.default_multiplex_config import DEFAULT_MULTIPLEX_CONFIG
+        from .configs.default_multiplex_config import DEFAULT_MULTIPLEX_CONFIG
         for key, value in DEFAULT_MULTIPLEX_CONFIG.items():
             if self.config_params.get(key) is None:
                 self.config_params[key] = value

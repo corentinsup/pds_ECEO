@@ -3,8 +3,9 @@ from pathlib import Path
 import albumentations as A
 from torch.utils.data import DataLoader
 from albumentations.pytorch import ToTensorV2
-from datasets.terramesh import Transpose, MultimodalTransforms, MultimodalNormalize, statistics
-from datasets.terramesh_dataset import TerraMeshDataset
+
+from local_datasets.terramesh import Transpose, MultimodalTransforms, MultimodalNormalize, statistics
+from local_datasets.terramesh_dataset import TerraMeshDataset
 from utils.utils import load_specs
 
 def train_epoch(modalities): 
