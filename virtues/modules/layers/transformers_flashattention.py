@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from .attention_flashattention import MHAwithPosEmb
+from .attention_multiheads import MHAwithPosEmb
 from .basic_modules import build_feedforward
 from .mask_utils_flashattention import (
     build_self_attention_bias,
@@ -62,8 +62,8 @@ class TransformerEncoder(nn.Module):
         src: torch.Tensor,                        # (B, S, d_model)
         src_pos: Optional[torch.Tensor] = None,   # (B, S, 2)
         src_key_padding_mask: Optional[torch.Tensor] = None,  # (B, S) bool or additive
-        cu_seq_len: Optional[torch.Tensor] = None,            # FlashAttention varlen
-        max_seq_len: Optional[int] = None,                    # FlashAttention varlen
+        #cu_seq_len: Optional[torch.Tensor] = None,            # FlashAttention varlen
+        #max_seq_len: Optional[int] = None,                    # FlashAttention varlen
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Returns:
@@ -75,8 +75,8 @@ class TransformerEncoder(nn.Module):
                 x,
                 src_pos=src_pos,
                 src_key_padding_mask=src_key_padding_mask,
-                cu_seq_len=cu_seq_len,
-                max_seq_len=max_seq_len,
+                #cu_seq_len=cu_seq_len,
+                #max_seq_len=max_seq_len,
             )
         return x
 
@@ -132,8 +132,8 @@ class TransformerEncoderBlock(nn.Module):
         src: torch.Tensor,                        # (B, S, d_model)
         src_pos: Optional[torch.Tensor] = None,   # (B, S, 2)
         src_key_padding_mask: Optional[torch.Tensor] = None,  # (B, S)
-        cu_seq_len: Optional[torch.Tensor] = None,
-        max_seq_len: Optional[int] = None,
+        #cu_seq_len: Optional[torch.Tensor] = None,
+        #max_seq_len: Optional[int] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # Pre-LN MHA
         x = src
@@ -147,8 +147,8 @@ class TransformerEncoderBlock(nn.Module):
             query_pos=src_pos,
             key_pos=src_pos,
             key_padding_mask=src_key_padding_mask,
-            cu_seq_len=cu_seq_len,
-            max_seq_len=max_seq_len,
+            #cu_seq_len=cu_seq_len,
+            #max_seq_len=max_seq_len,
         )
 
         # Pre-LN FFN
@@ -254,18 +254,18 @@ class ChannelAttentionEncoderBlock(nn.Module):
         x_false = x[mask_indices].unsqueeze(0)     # (1, N, D)
         pos_false = pos[mask_indices].unsqueeze(0) # (1, N, 2)
 
-        # Build varlen cumulative seq-lens for queries
+        '''# Build varlen cumulative seq-lens for queries
         seq_lens, max_seq_len = build_self_attention_bias(
             "ChannelAttention_cc_masked",
             mask,
             use_true_as_query=False,
-        )
+        )'''
 
         out = self.encoder_layer(
             src=x_false,
             src_pos=pos_false,
-            cu_seq_len=seq_lens,
-            max_seq_len=max_seq_len,
+            #cu_seq_len=seq_lens,
+            #max_seq_len=max_seq_len,
         )
         x_proc = out  # (1, N, D)
         x[mask_indices] = x_proc[0]
@@ -329,19 +329,20 @@ class MarkerAttentionEncoderBlock(nn.Module):
         mask_indices = get_non_zero_indices("MarkerAttention_masked_Mask_indices", ~mask_flat)
         x_false = x_flat[mask_indices].unsqueeze(0)     # (1, N, D)
         pos_false = pos_flat[mask_indices].unsqueeze(0) # (1, N, 2)
-
+        
+        '''
         # seq-lens across channels per (B, S) entry
         q_seq_lens, max_seq_len = build_self_attention_bias(
             "MarkerAttention_masked",
             mask_flat,
             use_true_as_query=False,
-        )
+        )'''
 
         out = self.encoder_layer(
             src=x_false,
             src_pos=pos_false,
-            cu_seq_len=q_seq_lens,
-            max_seq_len=max_seq_len,
+            #cu_seq_len=q_seq_lens,
+            #max_seq_len=max_seq_len,
         )
         x_proc = out
         x_flat[mask_indices] = x_proc[0]
@@ -370,15 +371,15 @@ class MarkerAttentionEncoderBlock(nn.Module):
         x_pack = rearrange(x, "C S D -> (S C) D").unsqueeze(0)    # (1, total, D)
         pos_pack = rearrange(pos, "C S D -> (S C) D").unsqueeze(0)
 
-        # FlashAttention varlen seq-lens (prepend 0, then cumsum)
+        '''# FlashAttention varlen seq-lens (prepend 0, then cumsum)
         cu = torch.zeros(q_lens.numel() + 1, dtype=torch.int32, device=x.device)
         cu[1:] = torch.cumsum(q_lens, dim=0)
-        max_seq_len = int(q_lens.max().item())
+        max_seq_len = int(q_lens.max().item())'''
         out = self.encoder_layer(
             src=x_pack,
             src_pos=pos_pack,
-            cu_seq_len=cu,
-            max_seq_len=max_seq_len,
+            #cu_seq_len=cu,
+            #max_seq_len=max_seq_len,
         )
         x_proc = out.squeeze(0)
         x_rec = rearrange(x_proc, "(S C) D -> C S D", S=S)
@@ -402,19 +403,19 @@ class MarkerAttentionEncoderBlock(nn.Module):
         x_false = x_seq[mask_indices].unsqueeze(0)     # (1, N, D)
         pos_false = pos_seq[mask_indices].unsqueeze(0) # (1, N, 2)
 
-        # Build varlen based on channel-concat per sample
+        '''# Build varlen based on channel-concat per sample
         seq_lens, max_seq_len = build_self_attention_bias_channel_concat(
             "MarkerAttention_cc_masked",
             mask_seq,
             tuple(channels_per_sample),
             use_true_as_query=False,
-        )
+        )'''
 
         out = self.encoder_layer(
             src=x_false,
             src_pos=pos_false,
-            cu_seq_len=seq_lens,
-            max_seq_len=max_seq_len,
+            #cu_seq_len=seq_lens,
+            #max_seq_len=max_seq_len,
         )
 
         x_proc = out
@@ -498,16 +499,16 @@ class FullAttentionEncoderBlock(nn.Module):
         x_pack = rearrange(x, "C S D -> (C S) D").unsqueeze(0)
         pos_pack = rearrange(pos, "C S D -> (C S) D").unsqueeze(0)
 
-        # Cumulative lengths (prepend 0)
+        '''# Cumulative lengths (prepend 0)
         cu = torch.zeros(q_lens.numel() + 1, dtype=torch.int32, device=x.device)
         cu[1:] = torch.cumsum(q_lens, dim=0)
-        max_seq_len = int(q_lens.max().item())
+        max_seq_len = int(q_lens.max().item())'''
 
         out = self.encoder_layer(
             src=x_pack,
             src_pos=pos_pack,
-            cu_seq_len=cu,
-            max_seq_len=max_seq_len,
+            #cu_seq_len=cu,
+            #max_seq_len=max_seq_len,
         )
 
         x_proc = out.squeeze(0)
@@ -538,19 +539,19 @@ class FullAttentionEncoderBlock(nn.Module):
         x_false = x_flat[mask_indices].unsqueeze(0)     # (1, N, D)
         pos_false = pos_flat[mask_indices].unsqueeze(0) # (1, N, 2)
 
-        # Varlen seq-lens from channel-concat mask
+        '''# Varlen seq-lens from channel-concat mask
         seq_lens, max_seq_len = build_self_attention_bias_channel_concat(
             "FullAttention_cc_masked",
             mask_flat,
             tokens_per_sample,
             use_true_as_query=False,
-        )
+        )'''
 
         out = self.encoder_layer(
             src=x_false,
             src_pos=pos_false,
-            cu_seq_len=seq_lens,
-            max_seq_len=max_seq_len,
+            #cu_seq_len=seq_lens,
+            #max_seq_len=max_seq_len,
         )
 
         x_proc = out
@@ -607,10 +608,10 @@ class CrossAttentionBlock(nn.Module):
         _prot = rearrange(x_keyval, "C S D -> (C S) D").unsqueeze(0)
         _pos = rearrange(pos, "C S D -> (C S) D").unsqueeze(0)
 
-        # Varlen cumulative sequence lengths
+        '''# Varlen cumulative sequence lengths
         cu = torch.zeros(q_lens.numel() + 1, dtype=torch.int32, device=x_query.device)
         cu[1:] = torch.cumsum(q_lens, dim=0)
-        max_seq_len = int(q_lens.max().item())
+        max_seq_len = int(q_lens.max().item())'''
 
         ca = self.attention_module(
             query=_x_attn,
@@ -619,8 +620,8 @@ class CrossAttentionBlock(nn.Module):
             query_pos=_pos,
             key_pos=_pos,
             key_padding_mask=None,
-            cu_seq_len=cu,
-            max_seq_len=max_seq_len,
+            #cu_seq_len=cu,
+            #max_seq_len=max_seq_len,
         )
         ca = rearrange(ca.squeeze(0), "(C S) D -> C S D", S=S)
         return ca
@@ -725,10 +726,16 @@ class PatchAttentionBlock(nn.Module):
         ps = rearrange(ps, "B S D -> (B S) D")
         psp = rearrange(psp, "B S D -> (B S) D")
 
-        B_eff = len(ps_position)
-        cu = torch.arange(B_eff + 1, device=x.device, dtype=torch.int32) * int(S)
+        #B_eff = len(ps_position)
+        #cu = torch.arange(B_eff + 1, device=x.device, dtype=torch.int32) * int(S)
 
-        ps = self.encoder_layer(src=ps.unsqueeze(0), src_pos=psp.unsqueeze(0), max_seq_len=int(S), cu_seq_len=cu)
+        ps = self.encoder_layer(
+            src=ps.unsqueeze(0), 
+            src_pos=psp.unsqueeze(0), 
+            #max_seq_len=int(S), 
+            #cu_seq_len=cu
+        )
+
         ps = rearrange(ps.squeeze(0), "(B S) D -> B S D", S=S)
 
         x[ps_position] = ps

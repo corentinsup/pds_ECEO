@@ -1,0 +1,24 @@
+#!/bin/bash
+#SBATCH --job-name=Test1_PDS_ECEO
+#SBATCH --time=5:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --qos=normal
+#SBATCH --mem=40G          # Increased memory for transformer training
+#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:1
+#SBATCH --output=slurm-%j.out
+#SBATCH --error=slurm-%j.err
+
+# --- Environment Setup ---
+module load gcc/11.3.0 python/3.10.4 cuda/12.1.1 cudnn/8.9.7.29-12
+source venvs/pds_env/bin/activate
+
+# --- Job Environment ---
+export CUDA_VISIBLE_DEVICES=0  # Explicitly set GPU
+export PYTHONUNBUFFERED=1      # Ensure Python output is not buffered
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}  # Optimize for multi-threading
+
+# --- Run Training ---
+echo "Starting training at $(date)"
+python pds_ECEO/virtues-main/train_terramesh.py

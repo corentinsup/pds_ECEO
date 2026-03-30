@@ -29,7 +29,7 @@ training:
 
 model:
   patch_size: 16
-  model_dim: 512
+  model_dim: 512 
   feedforward_dim: 768
   encoder_pattern: hvhv
   num_encoder_heads: 4

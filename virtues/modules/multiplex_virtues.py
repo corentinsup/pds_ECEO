@@ -274,7 +274,7 @@ class TerraMeshViTEncoder(nn.Module):
             else:
                 cat_multiplex = cat_multiplex + sensor_embeds
 
-        if self.self.prior_bias_embedding_type != 'wl':
+        if self.prior_bias_embedding_type != 'wl':
             prior_embeddings = self.prior_bias_embeddings[cat_channel_ids]  # (sum_C) D
             prior_embeddings = self.prior_embedding_encoder(prior_embeddings)  # (sum_C) model_dim
             prior_embeddings = prior_embeddings.unsqueeze(1).expand(*cat_multiplex.shape)  # (sum_C) (H W) model_dim
