@@ -77,7 +77,7 @@ def build_terramesh_dataset(
         path: str = "https://huggingface.co/datasets/ibm-esa-geospatial/TerraMesh/resolve/main/",
         modalities: list[str] | str = None,
         split: str = "val",
-        urls: str | None = None,
+        urls: str | list[str] | None = None,
         transform: Callable = None,
         batch_size: int = 8,
         return_metadata: bool = False,
@@ -308,7 +308,7 @@ def build_multimodal_dataset(
         path: str = "https://huggingface.co/datasets/ibm-esa-geospatial/TerraMesh/resolve/main/",
         modalities: list = None,
         split: str = "val",
-        urls: str | None = None,
+        urls: str | list | None = None,
         batch_size: int = 8,
         transform: Callable = None,
         return_metadata: bool = False,
@@ -336,10 +336,11 @@ def build_multimodal_dataset(
         '''urls_ssl4eos12 = os.path.join(path, split, f"[{','.join(filter_list(modalities, 'S1RTC'))}]",
                                       split_files["ssl4eos12"][split][0])'''
     else:
-        if "::" in urls:
+        '''if "::" in urls:
             urls_majortom, urls_ssl4eos12 = urls.split("::")
         else:
-            urls_majortom = urls_ssl4eos12 = urls
+            urls_majortom = urls_ssl4eos12 = urls'''
+        urls_majortom = urls
 
     ds_mt  = _subset_pipeline(urls_majortom,  batch_size=batch_size, shardshuffle=shardshuffle,
                               deterministic=deterministic, seed=seed, empty_check=empty_check,
@@ -357,7 +358,7 @@ def build_multimodal_dataset(
                             )'''
     # no need to mix since we completely remove S1GRD
     dataset = ds_mt
-    
+
     return dataset
 
 
@@ -542,6 +543,7 @@ class MultimodalTransforms:
         image_modality = "image" if "image" in data else \
             [k for k in data.keys() if k not in self.non_image_modalities][0]  # Find an image modality name
         data["image"] = data.pop(image_modality)  # albumentations expects an input called "image"
+        
         data = self.transforms(**data)
         data[image_modality] = data.pop("image")
 
@@ -554,22 +556,66 @@ class MultimodalTransforms:
 
 
 class MultimodalNormalize(albumentations.BasicTransform):
-    def __init__(self, mean: dict[str, list[float]], std: dict[str, list[float]]):
+    def __init__(self, mean: dict[str, list[float]], std: dict[str, list[float]], image_modality: str = None):
         super().__init__(p=1)
         self.mean = mean
         self.std = std
+        self.image_modality = image_modality  # the sensor name that became "image"
 
     def __call__(self, *args, force_apply=False, **data):
-        for m in self.mean.keys():
-            if m not in data:
-                continue
-            mean_arr = np.array(self.mean[m], dtype=np.float32)
-            std_arr = np.array(self.std[m], dtype=np.float32)
-            if data[m].ndim == 3 and data[m].shape[0] == mean_arr.shape[0]:
-                # Channel-first (C, H, W): reshape for broadcasting
-                mean_arr = mean_arr.reshape(-1, 1, 1)
-                std_arr = std_arr.reshape(-1, 1, 1)
-            data[m] = (data[m] - mean_arr) / std_arr
+        # Try to normalize all keys that match our statistics
+        for modality_key in list(self.mean.keys()):
+            if modality_key in data:
+                # Normalize by original modality name
+                mean_arr = np.array(self.mean[modality_key], dtype=np.float32)
+                std_arr = np.array(self.std.get(modality_key, self.mean[modality_key]), dtype=np.float32)
+                arr = data[modality_key]
+                
+                if arr.ndim == 3:
+                    if arr.shape[0] == mean_arr.shape[0]:
+                        # Channel-first (C, H, W): reshape for broadcasting
+                        mean_arr = mean_arr.reshape(-1, 1, 1)
+                        std_arr = std_arr.reshape(-1, 1, 1)
+                    elif arr.shape[2] == mean_arr.shape[0]:
+                        # Channel-last (H, W, C): reshape for broadcasting
+                        mean_arr = mean_arr.reshape(1, 1, -1)
+                        std_arr = std_arr.reshape(1, 1, -1)
+                    else:
+                        raise ValueError(f"Cannot apply normalization: modality {modality_key} has shape {arr.shape} which is incompatible with mean/std of shape {mean_arr.shape}.")
+                data[modality_key] = (data[modality_key] - mean_arr) / std_arr
+        
+        # Handle the case where a modality was renamed to "image" by MultimodalTransforms
+        if "image" in data and "image" not in self.mean:
+            arr = data["image"]
+            matched_modality = None
+            
+            # Try to match by shape: find which modality has compatible channel count
+            for modality_key in self.mean.keys():
+                mean_arr = np.array(self.mean[modality_key], dtype=np.float32)
+                if arr.ndim == 3:
+                    if (arr.shape[0] == mean_arr.shape[0]) or (arr.shape[2] == mean_arr.shape[0]):
+                        matched_modality = modality_key
+                        break
+            
+            # Fallback to image_modality or first modality if no shape match
+            if matched_modality is None:
+                matched_modality = self.image_modality or next(iter(self.mean.keys()))
+            
+            if matched_modality and matched_modality in self.mean:
+                mean_arr = np.array(self.mean[matched_modality], dtype=np.float32)
+                std_arr = np.array(self.std.get(matched_modality, self.mean[matched_modality]), dtype=np.float32)
+                
+                if arr.ndim == 3:
+                    if arr.shape[0] == mean_arr.shape[0]:
+                        # Channel-first (C, H, W): reshape for broadcasting
+                        mean_arr = mean_arr.reshape(-1, 1, 1)
+                        std_arr = std_arr.reshape(-1, 1, 1)
+                    elif arr.shape[2] == mean_arr.shape[0]:
+                        # Channel-last (H, W, C): reshape for broadcasting
+                        mean_arr = mean_arr.reshape(1, 1, -1)
+                        std_arr = std_arr.reshape(1, 1, -1)
+                data["image"] = (data["image"] - mean_arr) / std_arr
+        
         return data
 
     def apply(self, img, **params):

@@ -130,3 +130,14 @@ def set_specs(args):
         spectrum_specs = yaml.safe_load(f.read())
     args.spectrum_specs = spectrum_specs
     '''
+
+def build_urls(base_path, modalities, shard_names):
+    """
+    Build list of multi-modality URLs in the format multi_tarfile_samples expects:
+    /base/[S2L2A,S1GRD,DEM]/majortom_shard_000001.tar
+    """
+    modality_str = ",".join(modalities)
+    return [
+        os.path.join(base_path, f"[{modality_str}]", shard)
+        for shard in shard_names
+    ]

@@ -69,7 +69,6 @@ class TerraMeshViTEncoder(nn.Module):
             elif self.prior_bias_embedding_type == 'zero':
                 self.prior_bias_embeddings = nn.Parameter(torch.zeros_like(self.prior_bias_embeddings))
             elif self.prior_bias_embedding_type == 'wl':
-                self.C_max = 11
                 self.spectrum_projection = SpectrumAwareProjection(
                     spectrum_specs=spectrum_specs, 
                     patch_size=self.patch_size, 
@@ -194,7 +193,7 @@ class TerraMeshViTEncoder(nn.Module):
         # Sensor Embeddings 
         if sensor_ids is not None and self.use_prior_embedding:
             cat_sensor_ids = torch.cat(sensor_ids, dim=0).long() # (sum_C)
-            print("cat_sensor_ids:", cat_sensor_ids)
+            # print("cat_sensor_ids:", cat_sensor_ids)
             if torch.any(cat_sensor_ids < 0) or torch.any(cat_sensor_ids >= self.num_sensors):
                 bad_min = int(cat_sensor_ids.min().item())
                 bad_max = int(cat_sensor_ids.max().item())
@@ -207,9 +206,6 @@ class TerraMeshViTEncoder(nn.Module):
         # Wavelength-based Spectrum-aware Embeddings
         if projection_indices is not None:
             cat_proj_indices = torch.cat(projection_indices, dim=0)  # (sum_C) H W
-
-            scale_factors = torch.tensor([self.Cmax / C_i for C_i in multiplex_channels_per_sample
-                                          for _ in range(C_i)], device=cat_proj_indices.device)  # (sum_C)
 
             # proj_idx is spatially constant per channel → take the value at the first spatial position for each channel
             flat_proj_indices = cat_proj_indices[:, 0, 0].long()  # (sum_C_per_sample)
@@ -234,7 +230,7 @@ class TerraMeshViTEncoder(nn.Module):
                     )
                 patch_embeds[mask] = proj_out.to(dtype=patch_embeds.dtype)
 
-            cat_multiplex = patch_embeds*scale_factors[:, None, None, None]  # (sum_C, H, W, D)
+            cat_multiplex = patch_embeds  # (sum_C, H, W, D)
         else:
             # Fallback: single generic linear projection
             cat_multiplex = self.patch_encoder(cat_multiplex)  # (sum_C, H, W, D)
@@ -267,12 +263,12 @@ class TerraMeshViTEncoder(nn.Module):
         cat_multiplex = rearrange(cat_multiplex, "C H W D -> C (H W) D")
 
         # Concatenate sensor embeddings with cat_multiplex if sensor embeddings are used
-        if sensor_embeds is not None:
+        '''if sensor_embeds is not None:
             if self.prior_bias_embedding_fusion_type == 'concatenate':
                 cat_multiplex = torch.cat([cat_multiplex, sensor_embeds], dim=-1)  # (sum_C) (H W) 2*D
                 cat_multiplex = self.prior_embedding_linear(cat_multiplex)  # (sum_C) (H W) D
             else:
-                cat_multiplex = cat_multiplex + sensor_embeds
+                cat_multiplex = cat_multiplex + sensor_embeds'''
 
         if self.prior_bias_embedding_type != 'wl':
             prior_embeddings = self.prior_bias_embeddings[cat_channel_ids]  # (sum_C) D
@@ -280,8 +276,6 @@ class TerraMeshViTEncoder(nn.Module):
             prior_embeddings = prior_embeddings.unsqueeze(1).expand(*cat_multiplex.shape)  # (sum_C) (H W) model_dim
             if self.prior_bias_embedding_fusion_type == 'add':
                 cat_multiplex = cat_multiplex + prior_embeddings
-        else:
-            raise NotImplementedError("Cross-attention fusion not implemented yet") # @EJ'''
         
         cat_multiplex = torch.split(cat_multiplex, multiplex_channels_per_sample, dim=0)  # List[(C_i) (H W) D]
         if self.num_registers > 0:

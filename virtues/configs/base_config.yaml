@@ -1,12 +1,12 @@
-
-dataset_path: '../../scratch/izar/suply/dataset/data/data/TerraMesh/' # Path to dataset
-sensors_specs_path: 'pds_ECEO/config/pretraining_sensors.yaml' # Path to sensors specs file
-spectrum_specs_path: 'pds_ECEO/config/electromagnetic_spectrum.yaml' # Path to spectrum specs file
+dataset_path: '../../data/corentin/data/TerraMesh/val'
+#dataset_path: '../../scratch/izar/suply/dataset/data/data/TerraMesh/' # Path to dataset
+sensors_specs_path: 'pds_ECEO/spectrum/pretraining_sensors.yaml' # Path to sensors specs file
+spectrum_specs_path: 'pds_ECEO/spectrum/electromagnetic_spectrum.yaml' # Path to spectrum specs file
 
 experiments_dir: 'experiments/' # Outputs will be written to {experiments_dir}/{experiment.name}/
 
 experiment:
-  name: first_test # Initialize with the name of the run
+  name: only_wl_embedds_train_split_bf16 # Initialize with the name of the run
   seed: 42
   gpu: 0 # Set to None to use default GPU selection, or specify a GPU index (e.g., 0, 1, etc.)
   wandb_entity: corentin-suply-epfl
@@ -14,8 +14,8 @@ experiment:
   wandb_mode: online # "online", "offline", or "disabled"
 
 training:
-  epochs: 100
-  max_steps: 10048 # 80384 / (8 * 1) / 100 epochs ≈ 100 steps/epoch → 10,048 total steps
+  epochs: 10
+  max_steps: 75360 # 75360 = steps_per_epoch * epochs, where steps_per_epoch = train_images / batch_size = 60288/8 = 7536
   batch_size: 8
   fp16: True
   bf16: False
@@ -24,7 +24,7 @@ training:
   lr: 0.0002
   lr_scheduler_type: cosine
   weight_decay: 0.01
-  warmup_epochs: 10
+  warmup_epochs: 2
   disable_eval: false
 
 model:
@@ -43,7 +43,7 @@ model:
 
 data:
   crop_size: 224
-  masking_ratio: [0.6, 1.0]
+  masking_ratio: [0.6, 0.8]
   modalities:
   - "S2L2A"
   #- "S2L1C"

@@ -2,6 +2,8 @@ import os
 from pathlib import Path
 import torch
 import wandb
+import glob
+import random
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from omegaconf import OmegaConf
@@ -10,8 +12,8 @@ from transformers import Trainer, TrainingArguments
 from local_datasets.terramesh import Transpose, MultimodalTransforms, MultimodalNormalize, statistics
 from local_datasets.terramesh_dataset import TerraMeshDataset
 from utils.utils import is_rank0, set_seed, to_device, load_specs
-from utils.positional_encodings import WavelenghtSinusoidalEmbedding, Summer
 from virtues.modules.multiplex_virtues import TerraMeshViT
+from utils.utils import build_urls
 
 class TerraMeshViTTrainer(Trainer):
 
@@ -89,10 +91,8 @@ def train_virtues(conf):
     # Apply remap in-place (or on a copied dict)
     for k in sensor_specs:
         sensor_specs[k]["sensor_idx"] = old_to_new[sensor_specs[k]["sensor_idx"]]
-    print(sensor_specs)
     num_sensors = len(conf.data.sensors) 
-    print(f"Using {num_sensors} sensors for training: {conf.data.sensors}")
-   
+
     # Define multimodal transform function that converts the data into the expected shape from albumentations
     transforms = MultimodalTransforms(
         transforms=A.Compose([
@@ -108,14 +108,45 @@ def train_virtues(conf):
         non_image_modalities=["__key__", "__url__"],  # Additional non-image keys
     )
 
+    all_shard_names = sorted([
+    os.path.basename(s) 
+    for s in glob.glob(os.path.join(conf.dataset_path, conf.data.modalities[0], "*.tar"))
+    if "majortom" in os.path.basename(s)  # ← only keep majortom shards
+    ])
+    
+    print(f"DEBUG: Searching for tar files at: {os.path.join(conf.dataset_path, conf.data.modalities[0], '*.tar')}")
+    print(f"DEBUG: Found {len(all_shard_names)} majortom shards")
+    if all_shard_names:
+        print(f"DEBUG: First 3 shards: {all_shard_names[:3]}")
+    else:
+        # Try to see what files actually exist
+        all_files = glob.glob(os.path.join(conf.dataset_path, conf.data.modalities[0], "*.tar"))
+        print(f"DEBUG: All tar files found: {all_files}")
+        print(f"DEBUG: Dataset path: {conf.dataset_path}")
+        print(f"DEBUG: First modality: {conf.data.modalities[0]}")
+        raise ValueError(f"No majortom tar files found at {os.path.join(conf.dataset_path, conf.data.modalities[0])}")
+
+    random.shuffle(all_shard_names)
+    
+    train_shard_names = all_shard_names[:6]
+    test_shard_names = all_shard_names[6:]
+
+    train_urls = build_urls(conf.dataset_path, conf.data.modalities, train_shard_names)
+    print("Train URLs:")
+    for url in train_urls:
+        print(f"  {url}")
+    val_urls = build_urls(conf.dataset_path, conf.data.modalities, test_shard_names)
+
+
     # Create train and test datasets
     train_dataset = TerraMeshDataset(
-        path=conf.dataset_path,
+        #path=conf.dataset_path,
+        urls=train_urls,
         modalities=conf.data.modalities,
         sensor_specs=sensor_specs,
         spectrum_specs=spectrum_specs,
         shuffle=conf.data.shuffle,  
-        split= "val",
+        #split= "val",
         transform=transforms,
         seed=conf.experiment.seed,
         batch_size=conf.training.batch_size,
@@ -124,12 +155,13 @@ def train_virtues(conf):
     )
 
     test_dataset = TerraMeshDataset(
-        path=conf.dataset_path,
+        #path=conf.dataset_path,
+        urls=val_urls,
         modalities=conf.data.modalities,
         sensor_specs=sensor_specs,
         spectrum_specs=spectrum_specs,
         shuffle=conf.data.shuffle,  
-        split= "val",
+        #split= "val",
         transform=transforms,
         seed=conf.experiment.seed,
         batch_size=conf.training.batch_size,
@@ -214,6 +246,7 @@ def train_virtues(conf):
         report_to="wandb" if WANDB_AVAILABLE else "none",
         run_name=conf.experiment.name,
         gradient_accumulation_steps=conf.training.gradient_accumulation_steps,
+        max_grad_norm=1.0,
         learning_rate=conf.training.lr,
         lr_scheduler_type=conf.training.lr_scheduler_type,
         weight_decay=conf.training.weight_decay,

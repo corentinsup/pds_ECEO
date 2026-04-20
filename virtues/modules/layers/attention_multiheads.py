@@ -158,6 +158,8 @@ class MHAwithPosEmb(nn.Module):
         V = self.W_v(value)   # (B, S, E)
 
         # SDPA/manual path (supports attention return)
+        attn_mask: Optional[torch.Tensor] = None
+        sdpa_attn_mask: Optional[torch.Tensor] = None
         if key_padding_mask is not None:
             # Shape check
             if key_padding_mask.shape != (B, S):
@@ -165,45 +167,51 @@ class MHAwithPosEmb(nn.Module):
 
             # Prepare mask: (B, 1, 1, S) broadcastable to (B, H, L, S)
             if key_padding_mask.dtype == torch.bool:
-                # True = pad → add -inf
+                # key_padding_mask: True means "masked/pad"
+                # SDPA bool attn_mask: True means "keep/attend" (inverse convention)
+                sdpa_attn_mask = (~key_padding_mask)[:, None, None, :]
+
+                # Additive mask used by manual attention branch
                 attn_mask = torch.zeros(B, 1, 1, S, device=Q.device, dtype=Q.dtype)
                 attn_mask = attn_mask.masked_fill(key_padding_mask[:, None, None, :], float("-inf"))
             else:
                 # Assume already additive mask with -inf/0 of shape (B, S)
                 attn_mask = key_padding_mask[:, None, None, :].to(Q.dtype)
+                sdpa_attn_mask = attn_mask
 
-            # Reshape to heads: (B, H, N, D)
-            Q = Q.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-            K = K.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
-            V = V.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        # Reshape to heads: (B, H, N, D)
+        Q = Q.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        K = K.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        V = V.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
 
-            # Optional positional embedding AFTER linear projections (per head)
-            if self.pos_after_linear:
-                # Expand positions to (B, H, N, 2)
-                qpos = query_pos.unsqueeze(1).expand(-1, self.num_heads, -1, -1) if query_pos is not None else None
-                kpos = key_pos.unsqueeze(1).expand(-1, self.num_heads, -1, -1) if key_pos is not None else None
-                Q, K = self._apply_pos_after_linear_heads(Q, K, qpos, kpos, heads_expansion="BHN")
+        # Optional positional embedding AFTER linear projections (per head)
+        if self.pos_after_linear:
+            # Expand positions to (B, H, N, 2)
+            qpos = query_pos.unsqueeze(1).expand(-1, self.num_heads, -1, -1) if query_pos is not None else None
+            kpos = key_pos.unsqueeze(1).expand(-1, self.num_heads, -1, -1) if key_pos is not None else None
+            Q, K = self._apply_pos_after_linear_heads(Q, K, qpos, kpos, heads_expansion="BHN")
 
-            scale = 1.0 / math.sqrt(self.head_dim)
+        scale = 1.0 / math.sqrt(self.head_dim)
 
-            if not return_attention:
-                # Fast path: use PyTorch SDPA
-                attn_out = F.scaled_dot_product_attention(
-                    Q, K, V, attn_mask=attn_mask, dropout_p=self.dropout
-                )  # (B, H, L, D)
-            else:
-                # Manual attention to return weights
-                scores = torch.matmul(Q * scale, K.transpose(-2, -1))  # (B, H, L, S)
-                if attn_mask is not None:
-                    scores = scores + attn_mask
-                attn_probs = F.softmax(scores, dim=-1)
-                attn_probs = F.dropout(attn_probs, p=self.dropout, training=self.training)
-                attn_out = torch.matmul(attn_probs, V)  # (B, H, L, D)
+        if not return_attention:
+            # Fast path: use PyTorch SDPA
+            # sdpa_attn_mask is either bool keep-mask or additive -inf/0 mask
+            attn_out = F.scaled_dot_product_attention(
+                Q, K, V, attn_mask=sdpa_attn_mask, dropout_p=self.dropout
+            )  # (B, H, L, D)
+        else:
+            # Manual attention to return weights
+            scores = torch.matmul(Q * scale, K.transpose(-2, -1))  # (B, H, L, S)
+            if attn_mask is not None:
+                scores = scores + attn_mask
+            attn_probs = F.softmax(scores, dim=-1)
+            attn_probs = F.dropout(attn_probs, p=self.dropout, training=self.training)
+            attn_out = torch.matmul(attn_probs, V)  # (B, H, L, D)
 
-            # Merge heads
-            attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, self.embed_dim)
-            out = self.W_o(attn_out)
+        # Merge heads
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, self.embed_dim)
+        out = self.W_o(attn_out)
 
-            if return_attention:
-                return out, attn_probs  # (B, L, E), (B, H, L, S)
-            return out
+        if return_attention:
+            return out, attn_probs  # (B, L, E), (B, H, L, S)
+        return out

@@ -13,11 +13,12 @@ from utils.masking import generate_mask
 class TerraMeshDataset(IterableDataset):
     def __init__(
         self,
-        path: str,
+        #path: str,
+        urls: list[str],
         modalities: list[str] | str,
         sensor_specs: dict,
         spectrum_specs: dict,
-        split: str = "val",
+        #split: str = "val",
         transform=None,
         batch_size: int = 8,
         return_metadata: bool = False,
@@ -65,9 +66,10 @@ class TerraMeshDataset(IterableDataset):
        
         # Build the WebDataset pipeline using the provided build_terramesh_dataset function
         self.dataset = build_terramesh_dataset(
-            path=path,
+            #path=path,
+            urls=urls,
             modalities=modalities,
-            split=split,
+            #split=split,
             batch_size=batch_size,
             transform=transform,
             return_metadata=return_metadata,
@@ -106,6 +108,15 @@ class TerraMeshDataset(IterableDataset):
         channel_indices : Tensor [C_total]
         mask : Tensor [C_total, Hg, Wg] or [B, C_total, Hg, Wg]
         """
+        '''# print sample min-max for debugging
+        for m in self.modalities:
+            if m in sample:
+                # Convert to float for mean/std computation if needed
+                sample_m = sample[m].float() if not sample[m].is_floating_point() else sample[m]
+                print(f"Sample modality '{m}' stats: dtype: {sample[m].dtype}, min: {sample[m].min().item()}, max: {sample[m].max().item()}, mean: {sample_m.mean().item()}, std: {sample_m.std().item()}")
+            else:
+                print(f"Sample modality '{m}' is missing.")'''
+        
         # Concatenate & mask channels
         images = torch.cat([sample[m] for m in self.modalities], dim=-3)  # (B, C_total, H, W)
         images = images[:, self.channel_mask]                               # (B, C_present, H, W)
@@ -145,7 +156,7 @@ class TerraMeshDataset(IterableDataset):
             [generate_mask(C, H // self.patch_size, W // self.patch_size, self.masking_ratio)
             for _ in range(B)]
             )
-        
+
         return images, channel_indices, masks, sensor_indices, proj_indices
 
     def __iter__(self):
