@@ -42,7 +42,13 @@ class TerraMeshViTTrainer(Trainer):
         reconstructions = torch.concat(reconstructions, dim=0) # sum(C_i) x H x W
         targets = torch.concat(multiplex, dim=0) # sum(C_i) x H x W
         
-        loss = torch.mean(torch.pow(reconstructions - targets, 2))
+        #loss = torch.mean(torch.pow(reconstructions - targets, 2))
+        # compute loss only on masked patches
+    
+        mask = torch.concat(multiplex_mask, dim=0)  # (sum_C, H//p, W//p)
+        p = self.conf.model.patch_size
+        mask_full = mask.repeat_interleave(p, dim=-2).repeat_interleave(p, dim=-1)  # (sum_C, H, W)
+        loss = torch.mean(torch.pow((reconstructions - targets)[mask_full], 2))
         
         return (loss, outputs) if return_outputs else loss
 

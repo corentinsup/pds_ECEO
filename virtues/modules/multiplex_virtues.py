@@ -501,16 +501,7 @@ class TerraMeshViTDecoder(nn.Module):
     
 
 
-                
-
             
-
-
-
-
-
-
-
 class TerraMeshViT(nn.Module):
 
     VALID_PRIOR_BIAS_EMBEDDING_TYPES = {'zero', 'learnable', 'wl', 'dem', 'one_hot', 'empty'}

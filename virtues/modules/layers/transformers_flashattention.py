@@ -482,38 +482,39 @@ class FullAttentionEncoderBlock(nn.Module):
         channels_per_sample: Sequence[int],
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Full attention on concatenated (C × S) sequences per sample.
+        Full attention on (C_i × S) tokens per sample, processed as a proper batch.
+        Each sample is independent — tokens from different samples never attend to each other.
+        Per the VirTues paper, the decoder processes each channel group with 2*H*W tokens,
+        not all channels concatenated into one giant sequence.
 
         Args:
-            x: (C, S, D)
+            x: (C, S, D)  where C = sum of channels_per_sample
             pos: (C, S, 2)
-            channels_per_sample: list of channel counts per sample.
+            channels_per_sample: channel count per sample, e.g. [2]*112 for the decoder.
 
         Returns:
-            x': (C, S, D) 
+            x': (C, S, D)
         """
         S = x.shape[1]
-        # Per-sample lengths
-        q_lens = torch.as_tensor([c * S for c in channels_per_sample], device=x.device, dtype=torch.int32)
+        B = len(channels_per_sample)
 
-        x_pack = rearrange(x, "C S D -> (C S) D").unsqueeze(0)
-        pos_pack = rearrange(pos, "C S D -> (C S) D").unsqueeze(0)
-
-        '''# Cumulative lengths (prepend 0)
-        cu = torch.zeros(q_lens.numel() + 1, dtype=torch.int32, device=x.device)
-        cu[1:] = torch.cumsum(q_lens, dim=0)
-        max_seq_len = int(q_lens.max().item())'''
-
-        out = self.encoder_layer(
-            src=x_pack,
-            src_pos=pos_pack,
-            #cu_seq_len=cu,
-            #max_seq_len=max_seq_len,
-        )
-
-        x_proc = out.squeeze(0)
-        x_rec = rearrange(x_proc, "(C S) D -> C S D", S=S)
-        return x_rec
+        if len(set(channels_per_sample)) == 1:
+            # Uniform case (always true for the decoder): batch into (B, c*S, D)
+            c = channels_per_sample[0]
+            x_pack = rearrange(x, "(B C) S D -> B (C S) D", B=B, C=c)
+            pos_pack = rearrange(pos, "(B C) S D -> B (C S) D", B=B, C=c)
+            out = self.encoder_layer(src=x_pack, src_pos=pos_pack)
+            return rearrange(out, "B (C S) D -> (B C) S D", C=c)
+        else:
+            # Non-uniform: process each example independently
+            results, offset = [], 0
+            for c in channels_per_sample:
+                x_i = rearrange(x[offset:offset + c], "C S D -> (C S) D").unsqueeze(0)
+                pos_i = rearrange(pos[offset:offset + c], "C S D -> (C S) D").unsqueeze(0)
+                out_i = self.encoder_layer(src=x_i, src_pos=pos_i)
+                results.append(rearrange(out_i.squeeze(0), "(C S) D -> C S D", C=c, S=S))
+                offset += c
+            return torch.cat(results, dim=0)
 
     def forward_cc_masked(
         self,
@@ -523,41 +524,29 @@ class FullAttentionEncoderBlock(nn.Module):
         channels_per_sample: Sequence[int],
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Masked full attention over concatenated (C × S) sequences per sample using varlen FlashAttention.
-        Only the unmasked tokens are processed.
+        Masked full attention over (C_i × S) tokens per sample.
+        Each sample is processed independently with its own padding mask.
         """
         S = x.shape[1]
+        B = len(channels_per_sample)
 
-        x_flat = rearrange(x, "C S D -> (C S) D")
-        pos_flat = rearrange(pos, "C S D -> (C S) D")
-        mask_flat = rearrange(mask, "C S -> (C S)")
-
-        # Build per-sample token counts (C_i * S)
-        tokens_per_sample = tuple(int(c) * int(S) for c in channels_per_sample)
-
-        mask_indices = get_non_zero_indices("FullAttention_cc_Masked_Mask_indices", ~mask_flat)
-        x_false = x_flat[mask_indices].unsqueeze(0)     # (1, N, D)
-        pos_false = pos_flat[mask_indices].unsqueeze(0) # (1, N, 2)
-
-        '''# Varlen seq-lens from channel-concat mask
-        seq_lens, max_seq_len = build_self_attention_bias_channel_concat(
-            "FullAttention_cc_masked",
-            mask_flat,
-            tokens_per_sample,
-            use_true_as_query=False,
-        )'''
-
-        out = self.encoder_layer(
-            src=x_false,
-            src_pos=pos_false,
-            #cu_seq_len=seq_lens,
-            #max_seq_len=max_seq_len,
-        )
-
-        x_proc = out
-        x_flat[mask_indices] = x_proc[0]
-        x_rec = rearrange(x_flat, "(C S) D -> C S D", S=S)
-        return x_rec
+        if len(set(channels_per_sample)) == 1:
+            c = channels_per_sample[0]
+            x_flat = rearrange(x, "(B C) S D -> B (C S) D", B=B, C=c)
+            pos_flat = rearrange(pos, "(B C) S D -> B (C S) D", B=B, C=c)
+            mask_flat = rearrange(mask, "(B C) S -> B (C S)", B=B, C=c)
+            out = self.encoder_layer(src=x_flat, src_pos=pos_flat, src_key_padding_mask=mask_flat)
+            return rearrange(out, "B (C S) D -> (B C) S D", C=c)
+        else:
+            results, offset = [], 0
+            for c in channels_per_sample:
+                x_i = rearrange(x[offset:offset + c], "C S D -> (C S) D").unsqueeze(0)
+                pos_i = rearrange(pos[offset:offset + c], "C S D -> (C S) D").unsqueeze(0)
+                mask_i = rearrange(mask[offset:offset + c], "C S -> (C S)").unsqueeze(0)
+                out_i = self.encoder_layer(src=x_i, src_pos=pos_i, src_key_padding_mask=mask_i)
+                results.append(rearrange(out_i.squeeze(0), "(C S) D -> C S D", C=c, S=S))
+                offset += c
+            return torch.cat(results, dim=0)
 
 
 class CrossAttentionBlock(nn.Module):
