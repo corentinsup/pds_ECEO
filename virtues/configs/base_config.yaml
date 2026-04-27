@@ -16,11 +16,11 @@ experiment:
 training:
   epochs: 10
   max_steps: 75360 # 75360 = steps_per_epoch * epochs, where steps_per_epoch = train_images / batch_size = 60288/8 = 7536
-  batch_size: 8
+  batch_size: 2
   fp16: True
   bf16: False
   num_workers: 4
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 4
   lr: 0.0002
   lr_scheduler_type: cosine
   weight_decay: 0.01

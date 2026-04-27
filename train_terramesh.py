@@ -166,7 +166,7 @@ def train_virtues(conf):
         modalities=conf.data.modalities,
         sensor_specs=sensor_specs,
         spectrum_specs=spectrum_specs,
-        shuffle=conf.data.shuffle,  
+        shuffle=False,  # No shuffling for validation/test
         #split= "val",
         transform=transforms,
         seed=conf.experiment.seed,

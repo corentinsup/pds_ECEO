@@ -6,8 +6,32 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from .attention_multiheads import MHAwithPosEmb
+#from .attention_multiheads import MHAwithPosEmb
+from .attention_sdpa import MHAwithPosEmb
 from .basic_modules import build_feedforward
+from .mask_utils_flashattention import (
+    build_self_attention_bias,
+    build_self_attention_bias_channel_concat,
+    get_non_zero_indices,
+)
+
+
+def _block_diagonal_keep_mask(seg_lens: torch.Tensor) -> torch.Tensor:
+    """Build a (N, N) bool mask where True = positions can attend to each other.
+    Two positions can attend iff they belong to the same segment.
+
+    Args:
+        seg_lens: 1D int tensor of segment lengths summing to N.
+    Returns:
+        (N, N) bool tensor; True means "keep" (SDPA convention).
+    """
+    if seg_lens.numel() == 0:
+        return torch.zeros(0, 0, dtype=torch.bool, device=seg_lens.device)
+    seg_id = torch.repeat_interleave(
+        torch.arange(seg_lens.numel(), device=seg_lens.device, dtype=torch.long),
+        seg_lens.to(torch.long),
+    )
+    return seg_id[:, None] == seg_id[None, :]
 
 
 class TransformerEncoder(nn.Module):
@@ -57,6 +81,9 @@ class TransformerEncoder(nn.Module):
         src: torch.Tensor,                        # (B, S, d_model)
         src_pos: Optional[torch.Tensor] = None,   # (B, S, 2)
         src_key_padding_mask: Optional[torch.Tensor] = None,  # (B, S) bool or additive
+        attn_mask: Optional[torch.Tensor] = None,
+        #cu_seq_len: Optional[torch.Tensor] = None,            # FlashAttention varlen
+        #max_seq_len: Optional[int] = None,                    # FlashAttention varlen
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Returns:
@@ -68,6 +95,9 @@ class TransformerEncoder(nn.Module):
                 x,
                 src_pos=src_pos,
                 src_key_padding_mask=src_key_padding_mask,
+                attn_mask=attn_mask,
+                #cu_seq_len=cu_seq_len,
+                #max_seq_len=max_seq_len,
             )
         return x
 
@@ -123,10 +153,15 @@ class TransformerEncoderBlock(nn.Module):
         src: torch.Tensor,                        # (B, S, d_model)
         src_pos: Optional[torch.Tensor] = None,   # (B, S, 2)
         src_key_padding_mask: Optional[torch.Tensor] = None,  # (B, S)
+        attn_mask: Optional[torch.Tensor] = None, # (S, S) or (B, S, S) bool keep-mask, or additive
+        #cu_seq_len: Optional[torch.Tensor] = None,
+        #max_seq_len: Optional[int] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # Pre-LN MHA
         x = src
         x_norm = self.layernorm1(x)
+        # print shapes of all in next line
+        # print(f"[TransformerEncoderBlock] x_norm: {x_norm.shape}, src_pos: {src_pos.shape if src_pos is not None else None}, src_key_padding_mask: {src_key_padding_mask.shape if src_key_padding_mask is not None else None}, cu_seq_len: {cu_seq_len.shape if cu_seq_len is not None else None}, max_seq_len: {max_seq_len}")
         x = x + self.multi_head_attention(
             query=x_norm,
             key=x_norm,
@@ -134,6 +169,9 @@ class TransformerEncoderBlock(nn.Module):
             query_pos=src_pos,
             key_pos=src_pos,
             key_padding_mask=src_key_padding_mask,
+            attn_mask=attn_mask,
+            #cu_seq_len=cu_seq_len,
+            #max_seq_len=max_seq_len,
         )
 
         # Pre-LN FFN
@@ -146,8 +184,7 @@ class TransformerEncoderBlock(nn.Module):
 
 class ChannelAttentionEncoderBlock(nn.Module):
     """
-    Encoder over concatenated channels per sample (C x S x D).
-    Each channel attends only within its own spatial tokens — channels are independent.
+    Encoder over concatenated channels per sample (C x S x D), with varlen FlashAttention.
     """
 
     def __init__(
@@ -183,7 +220,7 @@ class ChannelAttentionEncoderBlock(nn.Module):
             x: (B, C, S, D)
             pos: (B, C, S, 2)
         """
-        raise NotImplementedError("Not yet implemented.")
+        raise NotImplementedError("Not yet implemented for FlashAttention path.")
 
     def forward_masked(
         self,
@@ -192,7 +229,15 @@ class ChannelAttentionEncoderBlock(nn.Module):
         mask: torch.Tensor,        # (B, C, S) True means masked token
         channels_per_sample: Optional[Sequence[int]] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        raise NotImplementedError("Not yet implemented.")
+        """
+        Masked variant using varlen FlashAttention over *unmasked* tokens.
+
+        Args:
+            x: (B, C, S, D)
+            pos: (B, C, S, 2)
+            mask: (B, C, S), True means masked.
+        """
+        raise NotImplementedError("Not yet implemented for FlashAttention path.")
 
     def forward_cc(
         self,
@@ -209,9 +254,9 @@ class ChannelAttentionEncoderBlock(nn.Module):
             channels_per_sample: list of channel counts per sample.
 
         Returns:
-            x': (C, S, D)
+            x': (C, S, D) 
         """
-        mask = torch.zeros(x.shape[0], x.shape[1], dtype=torch.bool, device=x.device)
+        mask = torch.zeros(x.shape[0], x.shape[1], dtype=torch.bool, device=x.device)  # (C, S) all unmasked
         return self.forward_cc_masked(x, pos, mask, channels_per_sample)
 
     def forward_cc_masked(
@@ -222,22 +267,38 @@ class ChannelAttentionEncoderBlock(nn.Module):
         channels_per_sample: Sequence[int],
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Intra-channel attention: each channel's S spatial tokens attend only within themselves.
-
-        The C channels are fully independent — treating C as the batch dimension gives
-        the correct isolation without any explicit boundary mechanism.
+        Channel attention: spatial tokens within each channel attend to each other.
+        Different channels do NOT interact.
 
         Returns:
-            x': (C, S, D)
+            x': (C, S, D) 
         """
-        # x: (C, S, D) — C plays the role of batch; each channel is an independent sequence.
-        # mask: (C, S) — True = masked/padding, matches key_padding_mask convention.
-        return self.encoder_layer(src=x, src_pos=pos, src_key_padding_mask=mask)
+        # Select unmasked rows for varlen pass
+        mask_indices = get_non_zero_indices("ChannelAttention_cc_Masked_Mask_indices", ~mask)
+        x_false = x[mask_indices].unsqueeze(0)     # (1, N, D)
+        pos_false = pos[mask_indices].unsqueeze(0) # (1, N, 2)
+
+        # Build block-diagonal keep-mask: tokens can only attend within their own channel.
+        # `mask` has shape (C, S); after flattening with `~mask`, the order is row-major (channel-major).
+        # So segment lengths = number of unmasked tokens per channel (per row of `mask`).
+        unmasked_per_channel = (~mask).sum(dim=1).to(torch.int64)  # (C,)
+        # Drop channels with 0 unmasked tokens (they contribute nothing)
+        unmasked_per_channel = unmasked_per_channel[unmasked_per_channel > 0]
+        keep_mask = _block_diagonal_keep_mask(unmasked_per_channel)  # (N, N)
+
+        out = self.encoder_layer(
+            src=x_false,
+            src_pos=pos_false,
+            attn_mask=keep_mask,
+        )
+        x_proc = out  # (1, N, D)
+        x[mask_indices] = x_proc[0]
+        return x
 
 
 class MarkerAttentionEncoderBlock(nn.Module):
     """
-    Encoder attending across channels for each (sample, spatial position) pair.
+    Encoder attending across markers for each spatial position (C as sequence).
     """
 
     def __init__(
@@ -273,7 +334,7 @@ class MarkerAttentionEncoderBlock(nn.Module):
             x: (B, C, S, D)
             pos: (B, C, S, 2)
         """
-        raise NotImplementedError("Not yet implemented.")
+        raise NotImplementedError("Not yet implemented for FlashAttention path.")
 
     def forward_masked(
         self,
@@ -282,16 +343,32 @@ class MarkerAttentionEncoderBlock(nn.Module):
         mask: torch.Tensor,         # (B, C, S) True means masked
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Each (sample b, spatial position s) is an independent sequence across channels.
-        Reshape to (B*S, C, D) so standard batched attention gives the correct isolation.
+        Varlen FlashAttention over unmasked items across channels for each spatial position.
         """
         B, C, S, D = x.shape
-        # Each (b, s) pair becomes an independent batch item; channels are the sequence.
         x_flat = rearrange(x, "B C S D -> (B S) C D")
-        pos_flat = rearrange(pos, "B C S d -> (B S) C d")
-        mask_flat = rearrange(mask, "B C S -> (B S) C")   # True = masked channel
-        out = self.encoder_layer(src=x_flat, src_pos=pos_flat, src_key_padding_mask=mask_flat)
-        return rearrange(out, "(B S) C D -> B C S D", B=B)
+        pos_flat = rearrange(pos, "B C S D -> (B S) C D")
+        mask_flat = rearrange(mask, "B C S -> (B S) C")
+
+        mask_indices = get_non_zero_indices("MarkerAttention_masked_Mask_indices", ~mask_flat)
+        x_false = x_flat[mask_indices].unsqueeze(0)     # (1, N, D)
+        pos_false = pos_flat[mask_indices].unsqueeze(0) # (1, N, 2)
+        
+        # Segments = unmasked channels per (b, s) row
+        seg_lens = (~mask_flat).sum(dim=1).to(torch.long)        # (B*S,)
+        seg_lens = seg_lens[seg_lens > 0]
+        keep_mask = _block_diagonal_keep_mask(seg_lens)  # (N, N) bool
+ 
+        out = self.encoder_layer(
+            src=x_false,
+            src_pos=pos_false,
+            attn_mask=keep_mask,
+        )
+
+        x_proc = out
+        x_flat[mask_indices] = x_proc[0]
+        x = rearrange(x_flat, "(B S) C D -> B C S D", B=B)
+        return x
 
     def forward_cc(
         self,
@@ -300,13 +377,31 @@ class MarkerAttentionEncoderBlock(nn.Module):
         channels_per_sample: Sequence[int],
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Concatenated-channels variant (no masking).
-
-        For each (sample b, spatial position s) the c_b channels of sample b attend
-        to each other.  Delegates to forward_cc_masked with an all-False mask.
+        Marker attention (unmasked): tokens at the same spatial position within the
+        same sample attend to each other across channels. Different samples and
+        different spatial positions do NOT interact.
         """
-        mask = torch.zeros(x.shape[0], x.shape[1], dtype=torch.bool, device=x.device)
-        return self.forward_cc_masked(x, pos, mask, channels_per_sample)
+        S = x.shape[1]
+        # Per-(spatial_position, sample) segment lengths.
+        # The rearrange below iterates s outer, c inner; within each s, c ranges over
+        # the concatenated channels-per-sample. So segments are repeated per s:
+        # [c_0, c_1, ..., c_{B-1}] x S
+        cps = list(channels_per_sample)
+        q_lens = torch.as_tensor(cps * int(S), device=x.device, dtype=torch.long)
+
+        # Flatten to a single batch
+        x_pack = rearrange(x, "C S D -> (S C) D").unsqueeze(0)    # (1, total, D)
+        pos_pack = rearrange(pos, "C S D -> (S C) D").unsqueeze(0)
+
+        keep_mask = _block_diagonal_keep_mask(q_lens)  # (N, N)
+        out = self.encoder_layer(
+            src=x_pack,
+            src_pos=pos_pack,
+            attn_mask=keep_mask,
+        )
+        x_proc = out.squeeze(0)
+        x_rec = rearrange(x_proc, "(S C) D -> C S D", S=S)
+        return x_rec
 
     def forward_cc_masked(
         self,
@@ -316,35 +411,43 @@ class MarkerAttentionEncoderBlock(nn.Module):
         channels_per_sample: Sequence[int],
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Each (sample, spatial position) pair is an independent sequence.
-
-        Uniform case: reshape (C=B*c, S, D) → (B*S, c, D), run encoder, reshape back.
-        Non-uniform case: loop over samples, treating (S, c_b, D) as a batch of S
-        independent sequences of length c_b (one per spatial position).
+        Marker attention: tokens at the same spatial position within the same sample
+        attend to each other across channels. Different samples and different spatial
+        positions do NOT interact.
         """
-        S = x.shape[1]
+        x_seq = rearrange(x, "C S D -> S C D")
+        pos_seq = rearrange(pos, "C S D -> S C D")
+        mask_seq = rearrange(mask, "C S -> S C")  # (S, C) True = masked
 
-        if len(set(channels_per_sample)) == 1:
-            c = channels_per_sample[0]
-            B = len(channels_per_sample)
-            # (B*c, S, D) → (B, c, S, D) → (B*S, c, D)
-            x_pack = rearrange(x, "(B C) S D -> (B S) C D", B=B, C=c)
-            pos_pack = rearrange(pos, "(B C) S d -> (B S) C d", B=B, C=c)
-            mask_pack = rearrange(mask, "(B C) S -> (B S) C", B=B, C=c)
-            out = self.encoder_layer(src=x_pack, src_pos=pos_pack, src_key_padding_mask=mask_pack)
-            # (B*S, c, D) → (B*c, S, D)
-            return rearrange(out, "(B S) C D -> (B C) S D", B=B)
-        else:
-            results, offset = [], 0
-            for c in channels_per_sample:
-                # Treat S spatial positions as the batch; c channels as the sequence.
-                x_b = rearrange(x[offset:offset + c], "C S D -> S C D")
-                pos_b = rearrange(pos[offset:offset + c], "C S d -> S C d")
-                mask_b = rearrange(mask[offset:offset + c], "C S -> S C")
-                out_b = self.encoder_layer(src=x_b, src_pos=pos_b, src_key_padding_mask=mask_b)
-                results.append(rearrange(out_b, "S C D -> C S D"))
-                offset += c
-            return torch.cat(results, dim=0)
+        mask_indices = get_non_zero_indices("MarkerAttention_cc_Masked_Mask_indices", ~mask_seq)
+        x_false = x_seq[mask_indices].unsqueeze(0)     # (1, N, D)
+        pos_false = pos_seq[mask_indices].unsqueeze(0) # (1, N, 2)
+
+        # For each spatial position s and each sample b, count unmasked channels.
+        # Order in flattened (S, C) is s-major: s=0,b=0; s=0,b=1; ...; s=1,b=0; ...
+        S_dim = mask_seq.shape[0]
+        unmasked_per_pos_per_sample = torch.zeros(
+            S_dim, len(channels_per_sample), device=x.device, dtype=torch.long
+        )
+        c_offset = 0
+        for b, c_b in enumerate(channels_per_sample):
+            unmasked_per_pos_per_sample[:, b] = keep[:, c_offset:c_offset + c_b].sum(dim=1)
+            c_offset += c_b
+ 
+        seg_lens = unmasked_per_pos_per_sample.reshape(-1)  # (S * B,) s-major
+        seg_lens = seg_lens[seg_lens > 0]
+        keep_mask = _block_diagonal_keep_mask(seg_lens)     # (N, N) bool
+
+        out = self.encoder_layer(
+            src=x_false,
+            src_pos=pos_false,
+            attn_mask=keep_mask,
+        )
+
+        x_proc = out
+        x_seq[mask_indices] = x_proc[0]
+        x_rec = rearrange(x_seq, "S C D -> C S D")
+        return x_rec
 
 
 class FullAttentionEncoderBlock(nn.Module):
@@ -385,7 +488,7 @@ class FullAttentionEncoderBlock(nn.Module):
             x: (B, C, S, D)
             pos: (B, C, S, 2)
         """
-        raise NotImplementedError("Not yet implemented.")
+        raise NotImplementedError("Not yet implemented for FlashAttention path.")
 
     def forward_masked(
         self,
@@ -393,7 +496,10 @@ class FullAttentionEncoderBlock(nn.Module):
         pos: torch.Tensor,       # (B, C, S, 2)
         mask: torch.Tensor,      # (B, C, S)
     ) -> torch.Tensor:
-        raise NotImplementedError("Not yet implemented.")
+        """
+        Masked full attention path (not implemented in varlen form).
+        """
+        raise NotImplementedError("Not yet implemented for FlashAttention path.")
 
     def forward_cc(
         self,
@@ -402,39 +508,34 @@ class FullAttentionEncoderBlock(nn.Module):
         channels_per_sample: Sequence[int],
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Full attention on (C_i × S) tokens per sample, processed as a proper batch.
-        Each sample is independent — tokens from different samples never attend to each other.
-        Per the VirTues paper, the decoder processes each channel group with 2*H*W tokens,
-        not all channels concatenated into one giant sequence.
+        Full attention on concatenated (C × S) sequences per sample.
 
         Args:
-            x: (C, S, D)  where C = sum of channels_per_sample
+            x: (C, S, D)
             pos: (C, S, 2)
-            channels_per_sample: channel count per sample, e.g. [2]*112 for the decoder.
+            channels_per_sample: list of channel counts per sample.
 
         Returns:
-            x': (C, S, D)
+            x': (C, S, D) 
         """
         S = x.shape[1]
-        B = len(channels_per_sample)
+        # Per-sample lengths in the flattened (C S) sequence
+        q_lens = torch.as_tensor([c * S for c in channels_per_sample], device=x.device, dtype=torch.long)
 
-        if len(set(channels_per_sample)) == 1:
-            # Uniform case (always true for the decoder): batch into (B, c*S, D)
-            c = channels_per_sample[0]
-            x_pack = rearrange(x, "(B C) S D -> B (C S) D", B=B, C=c)
-            pos_pack = rearrange(pos, "(B C) S D -> B (C S) D", B=B, C=c)
-            out = self.encoder_layer(src=x_pack, src_pos=pos_pack)
-            return rearrange(out, "B (C S) D -> (B C) S D", C=c)
-        else:
-            # Non-uniform: process each example independently
-            results, offset = [], 0
-            for c in channels_per_sample:
-                x_i = rearrange(x[offset:offset + c], "C S D -> (C S) D").unsqueeze(0)
-                pos_i = rearrange(pos[offset:offset + c], "C S D -> (C S) D").unsqueeze(0)
-                out_i = self.encoder_layer(src=x_i, src_pos=pos_i)
-                results.append(rearrange(out_i.squeeze(0), "(C S) D -> C S D", C=c, S=S))
-                offset += c
-            return torch.cat(results, dim=0)
+        x_pack = rearrange(x, "C S D -> (C S) D").unsqueeze(0)
+        pos_pack = rearrange(pos, "C S D -> (C S) D").unsqueeze(0)
+
+        keep_mask = _block_diagonal_keep_mask(q_lens)  # (N, N)
+
+        out = self.encoder_layer(
+            src=x_pack,
+            src_pos=pos_pack,
+            attn_mask=keep_mask,
+        )
+
+        x_proc = out.squeeze(0)
+        x_rec = rearrange(x_proc, "(C S) D -> C S D", S=S)
+        return x_rec
 
     def forward_cc_masked(
         self,
@@ -444,29 +545,44 @@ class FullAttentionEncoderBlock(nn.Module):
         channels_per_sample: Sequence[int],
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Masked full attention over (C_i × S) tokens per sample.
-        Each sample is processed independently with its own padding mask.
+        Full attention within each sample's tokens, masked variant. Only unmasked tokens
+        are processed; different samples do NOT interact.
         """
         S = x.shape[1]
-        B = len(channels_per_sample)
 
-        if len(set(channels_per_sample)) == 1:
-            c = channels_per_sample[0]
-            x_flat = rearrange(x, "(B C) S D -> B (C S) D", B=B, C=c)
-            pos_flat = rearrange(pos, "(B C) S D -> B (C S) D", B=B, C=c)
-            mask_flat = rearrange(mask, "(B C) S -> B (C S)", B=B, C=c)
-            out = self.encoder_layer(src=x_flat, src_pos=pos_flat, src_key_padding_mask=mask_flat)
-            return rearrange(out, "B (C S) D -> (B C) S D", C=c)
-        else:
-            results, offset = [], 0
-            for c in channels_per_sample:
-                x_i = rearrange(x[offset:offset + c], "C S D -> (C S) D").unsqueeze(0)
-                pos_i = rearrange(pos[offset:offset + c], "C S D -> (C S) D").unsqueeze(0)
-                mask_i = rearrange(mask[offset:offset + c], "C S -> (C S)").unsqueeze(0)
-                out_i = self.encoder_layer(src=x_i, src_pos=pos_i, src_key_padding_mask=mask_i)
-                results.append(rearrange(out_i.squeeze(0), "(C S) D -> C S D", C=c, S=S))
-                offset += c
-            return torch.cat(results, dim=0)
+        x_flat = rearrange(x, "C S D -> (C S) D")
+        pos_flat = rearrange(pos, "C S D -> (C S) D")
+        mask_flat = rearrange(mask, "C S -> (C S)")
+
+        mask_indices = get_non_zero_indices("FullAttention_cc_Masked_Mask_indices", ~mask_flat)
+        x_false = x_flat[mask_indices].unsqueeze(0)     # (1, N, D)
+        pos_false = pos_flat[mask_indices].unsqueeze(0) # (1, N, 2)
+
+        # Segments are samples. After flattening (C, S) row-major, sample b's tokens
+        # occupy a contiguous range of c_b * S positions in (C S).
+        # For each sample, count unmasked tokens in its slice.
+        device = x.device
+        seg_lens_list = []
+        c_offset = 0
+        for c_b in channels_per_sample:
+            sample_mask = mask[c_offset:c_offset + c_b]  # (c_b, S)
+            n_unmasked = int((~sample_mask).sum().item())
+            if n_unmasked > 0:
+                seg_lens_list.append(n_unmasked)
+            c_offset += c_b
+        seg_lens = torch.as_tensor(seg_lens_list, device=device, dtype=torch.long)
+        keep_mask = _block_diagonal_keep_mask(seg_lens)  # (N, N)
+
+        out = self.encoder_layer(
+            src=x_false,
+            src_pos=pos_false,
+            attn_mask=keep_mask,
+        )
+
+        x_proc = out
+        x_flat[mask_indices] = x_proc[0]
+        x_rec = rearrange(x_flat, "(C S) D -> C S D", S=S)
+        return x_rec
 
 
 class CrossAttentionBlock(nn.Module):
@@ -504,45 +620,33 @@ class CrossAttentionBlock(nn.Module):
         multiplex_channels_per_sample: Sequence[int],
     ) -> torch.Tensor:
         """
-        Cross-attention from x_query to x_keyval, with each sample processed independently.
-
-        Uniform case: reshape (C=B*c, S, D) → (B, c*S, D), run cross-attention, reshape back.
-        Non-uniform case: loop over samples.
+        Pack sequences by sample (length = channels_i * S) and apply cross-attention.
 
         Returns:
             (C_total, S, D)
         """
         C_total, S, D = x_query.shape
-        B = len(multiplex_channels_per_sample)
+        q_lens = torch.as_tensor([c * S for c in multiplex_channels_per_sample], device=x_query.device, dtype=torch.long)
 
-        if len(set(multiplex_channels_per_sample)) == 1:
-            c = multiplex_channels_per_sample[0]
-            q_pack = rearrange(x_query, "(B C) S D -> B (C S) D", B=B, C=c)
-            kv_pack = rearrange(x_keyval, "(B C) S D -> B (C S) D", B=B, C=c)
-            pos_pack = rearrange(pos, "(B C) S d -> B (C S) d", B=B, C=c)
-            ca = self.attention_module(
-                query=q_pack,
-                key=kv_pack,
-                value=kv_pack,
-                query_pos=pos_pack,
-                key_pos=pos_pack,
-                key_padding_mask=None,
-            )
-            return rearrange(ca, "B (C S) D -> (B C) S D", C=c)
-        else:
-            results, offset = [], 0
-            for c in multiplex_channels_per_sample:
-                q_i = rearrange(x_query[offset:offset + c], "C S D -> (C S) D").unsqueeze(0)
-                kv_i = rearrange(x_keyval[offset:offset + c], "C S D -> (C S) D").unsqueeze(0)
-                p_i = rearrange(pos[offset:offset + c], "C S d -> (C S) d").unsqueeze(0)
-                ca_i = self.attention_module(
-                    query=q_i, key=kv_i, value=kv_i,
-                    query_pos=p_i, key_pos=p_i,
-                    key_padding_mask=None,
-                )
-                results.append(rearrange(ca_i.squeeze(0), "(C S) D -> C S D", C=c, S=S))
-                offset += c
-            return torch.cat(results, dim=0)
+        # Pack as a single batch item
+        _x_attn = rearrange(x_query, "C S D -> (C S) D").unsqueeze(0)  # (1, sumL, D)
+        _prot = rearrange(x_keyval, "C S D -> (C S) D").unsqueeze(0)
+        _pos = rearrange(pos, "C S D -> (C S) D").unsqueeze(0)
+
+        # Block-diagonal keep-mask: query in sample b can only attend to keys in sample b.
+        # Q and KV have the same length here, so this is the same square mask we use elsewhere.
+        keep_mask = _block_diagonal_keep_mask(seg_lens)  # (N, N) bool
+ 
+        ca = self.attention_module(
+            query=_x_attn,
+            key=_prot,
+            value=_prot,
+            query_pos=_pos,
+            key_pos=_pos,
+            attn_mask=keep_mask,
+        )
+        ca = rearrange(ca.squeeze(0), "(C S) D -> C S D", S=S)
+        return ca
 
 
 class PatchAttentionBlock(nn.Module):
@@ -591,13 +695,23 @@ class PatchAttentionBlock(nn.Module):
         """
         B, C, S, D = x.shape
 
-        # First channel holds the patch summary tokens: (B, S, D)
-        # Treat as standard batch of B independent sequences of length S.
-        ps = x[:, 0]    # (B, S, D)
-        psp = pos[:, 0]  # (B, S, 2)
+        # Take only the patch summary tokens: the first token across channels (index 0)
+        ps = x[:, 0]      # (B, S, D)
+        psp = pos[:, 0]   # (B, S, 2)
 
-        ps_out = self.encoder_layer(src=ps, src_pos=psp)  # (B, S, D)
-        x[:, 0] = ps_out
+        # Pack into single long sequence
+        ps = rearrange(ps, "B S D -> (B S) D").unsqueeze(0)    # (1, B*S, D)
+        psp = rearrange(psp, "B S D -> (B S) D").unsqueeze(0)  # (1, B*S, 2)
+
+        # Block-diagonal keep-mask: each sample's S tokens form a segment.
+        seg_lens = torch.full((B,), int(S), device=x.device, dtype=torch.long)
+        keep_mask = _block_diagonal_keep_mask(seg_lens)  # (B*S, B*S) bool
+
+        ps = self.encoder_layer(src=ps, src_pos=psp, attn_mask=keep_mask)
+        ps = rearrange(ps.squeeze(0), "(B S) D -> B S D", S=S)
+
+        # Write back refined summary tokens
+        x[:, 0] = ps
         return x
 
     def forward_masked(self, x: torch.Tensor, pos: torch.Tensor, mask: torch.Tensor, **kwargs) -> torch.Tensor:
@@ -614,20 +728,39 @@ class PatchAttentionBlock(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         """
-        Gather the first channel of each sample (patch summary token) and refine via attention.
+        Gather the first token of each channel group (per sample) and refine via attention.
 
-        Each sample's S summary tokens form an independent sequence — standard batched attention
-        gives the correct isolation.
+        Args:
+            x: (C, S, D)
+            pos: (C, S, 2)
+            channels_per_sample: list with counts per sample; positions of first tokens
+                                 are cumulative sums of these counts.
         """
-        # Starting index of each sample in the C dimension.
-        # e.g. channels_per_sample=[3,2,4] → offsets=[0,3,5]
-        offsets = np.cumsum([0] + list(channels_per_sample)[:-1])
+        C, S, D = x.shape
 
-        ps = x[offsets]    # (B, S, D)
-        psp = pos[offsets]  # (B, S, 2)
+        # Indices of the first token per channel group: cumulative sums across channel counts
+        ps_position = np.cumsum(channels_per_sample)
+        ps_position -= ps_position[0]  # shift to start at 0
 
-        ps_out = self.encoder_layer(src=ps, src_pos=psp)  # (B, S, D)
-        x[offsets] = ps_out
+        ps = x[ps_position]       # (B, S, D) where B = len(ps_position)
+        psp = pos[ps_position]    # (B, S, 2)
+
+        ps = rearrange(ps, "B S D -> (B S) D")
+        psp = rearrange(psp, "B S D -> (B S) D")
+
+        B_eff = len(ps_position)
+        seq_lens = torch.full((B_eff,), int(S), device=x.device, dtype=torch.long)
+        keep_mask = _block_diagonal_keep_mask(seq_lens)
+
+        ps = self.encoder_layer(
+            src=ps.unsqueeze(0), 
+            src_pos=psp.unsqueeze(0), 
+            attn_mask=keep_mask
+        )
+
+        ps = rearrange(ps.squeeze(0), "(B S) D -> B S D", S=S)
+
+        x[ps_position] = ps
         return x
 
     def forward_cc_masked(
