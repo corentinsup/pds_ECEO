@@ -1,0 +1,47 @@
+{
+  "os": "Linux-5.11.0-43-generic-x86_64-with-glibc2.31",
+  "python": "CPython 3.11.15",
+  "startedAt": "2026-05-08T14:04:13.933495Z",
+  "program": "/home/corentinS/pds_ECEO/inference.ipynb",
+  "codePath": "/home/corentinS/pds_ECEO/inference.ipynb",
+  "codePathLocal": "inference.ipynb",
+  "git": {
+    "remote": "https://github.com/corentinsup/pds_ECEO.git",
+    "commit": "a286e49f9f1af9824cc9d55f91c05dfaed89ca34"
+  },
+  "email": "corentin.suply@epfl.ch",
+  "root": "/home/corentinS/pds_ECEO",
+  "host": "ECEO-ws1",
+  "executable": "/home/corentinS/.conda/envs/pds_env/bin/python",
+  "cpu_count": 4,
+  "cpu_count_logical": 4,
+  "gpu": "NVIDIA GeForce RTX 2080 Ti",
+  "gpu_count": 2,
+  "disk": {
+    "/": {
+      "total": "240830570496",
+      "used": "108019867648"
+    }
+  },
+  "memory": {
+    "total": "33603133440"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA GeForce RTX 2080 Ti",
+      "memoryTotal": "11811160064",
+      "cudaCores": 4352,
+      "architecture": "Turing",
+      "uuid": "GPU-a50872cf-ac89-65da-6d31-b10dba7dc40d"
+    },
+    {
+      "name": "NVIDIA GeForce GTX 980 Ti",
+      "memoryTotal": "6442450944",
+      "cudaCores": 2816,
+      "architecture": "Maxwell",
+      "uuid": "GPU-f87035ab-5461-7aac-97b3-7dd9737dc179"
+    }
+  ],
+  "cudaVersion": "12.4",
+  "writerId": "owuix51ii8q13u84f1umarlqt15x4lnd"
+}

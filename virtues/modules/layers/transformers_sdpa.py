@@ -418,6 +418,7 @@ class MarkerAttentionEncoderBlock(nn.Module):
         x_seq = rearrange(x, "C S D -> S C D")
         pos_seq = rearrange(pos, "C S D -> S C D")
         mask_seq = rearrange(mask, "C S -> S C")  # (S, C) True = masked
+        keep = ~mask_seq  # (S, C) True = keep
 
         mask_indices = get_non_zero_indices("MarkerAttention_cc_Masked_Mask_indices", ~mask_seq)
         x_false = x_seq[mask_indices].unsqueeze(0)     # (1, N, D)

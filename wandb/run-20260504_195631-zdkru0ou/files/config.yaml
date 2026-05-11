@@ -1,0 +1,60 @@
+_wandb:
+    value:
+        cli_version: 0.25.1
+        e:
+            12b311zyzvg64esrfabwecfk5a9xfug2:
+                codePath: /home/corentinS/pds_ECEO/inference.ipynb
+                codePathLocal: inference.ipynb
+                cpu_count: 4
+                cpu_count_logical: 4
+                cudaVersion: "12.4"
+                disk:
+                    /:
+                        total: "240830570496"
+                        used: "107620294656"
+                email: corentin.suply@epfl.ch
+                executable: /home/corentinS/.conda/envs/pds_env/bin/python
+                git:
+                    commit: a286e49f9f1af9824cc9d55f91c05dfaed89ca34
+                    remote: https://github.com/corentinsup/pds_ECEO.git
+                gpu: NVIDIA GeForce RTX 2080 Ti
+                gpu_count: 2
+                gpu_nvidia:
+                    - architecture: Turing
+                      cudaCores: 4352
+                      memoryTotal: "11811160064"
+                      name: NVIDIA GeForce RTX 2080 Ti
+                      uuid: GPU-a50872cf-ac89-65da-6d31-b10dba7dc40d
+                    - architecture: Maxwell
+                      cudaCores: 2816
+                      memoryTotal: "6442450944"
+                      name: NVIDIA GeForce GTX 980 Ti
+                      uuid: GPU-f87035ab-5461-7aac-97b3-7dd9737dc179
+                host: ECEO-ws1
+                memory:
+                    total: "33603133440"
+                os: Linux-5.11.0-43-generic-x86_64-with-glibc2.31
+                program: /home/corentinS/pds_ECEO/inference.ipynb
+                python: CPython 3.11.15
+                root: /home/corentinS/pds_ECEO
+                startedAt: "2026-05-04T17:56:31.008341Z"
+                writerId: 12b311zyzvg64esrfabwecfk5a9xfug2
+        m: []
+        python_version: 3.11.15
+        t:
+            "1":
+                - 1
+                - 49
+                - 80
+            "2":
+                - 1
+                - 49
+                - 80
+            "3":
+                - 2
+            "4": 3.11.15
+            "5": 0.25.1
+            "8":
+                - 1
+            "12": 0.25.1
+            "13": linux-x86_64

@@ -11,9 +11,8 @@ from transformers import Trainer, TrainingArguments
 
 from local_datasets.terramesh import Transpose, MultimodalTransforms, MultimodalNormalize, statistics
 from local_datasets.terramesh_dataset import TerraMeshDataset
-from utils.utils import is_rank0, set_seed, to_device, load_specs
+from utils.utils import is_rank0, set_seed, to_device, load_specs, build_urls
 from virtues.modules.multiplex_virtues import TerraMeshViT
-from utils.utils import build_urls
 
 class TerraMeshViTTrainer(Trainer):
 
@@ -42,13 +41,13 @@ class TerraMeshViTTrainer(Trainer):
         reconstructions = torch.concat(reconstructions, dim=0) # sum(C_i) x H x W
         targets = torch.concat(multiplex, dim=0) # sum(C_i) x H x W
         
-        #loss = torch.mean(torch.pow(reconstructions - targets, 2))
+        loss = torch.mean(torch.pow(reconstructions - targets, 2))
         # compute loss only on masked patches
-    
-        mask = torch.concat(multiplex_mask, dim=0)  # (sum_C, H//p, W//p)
+
+        '''mask = torch.concat(multiplex_mask, dim=0)  # (sum_C, H//p, W//p)
         p = self.conf.model.patch_size
         mask_full = mask.repeat_interleave(p, dim=-2).repeat_interleave(p, dim=-1)  # (sum_C, H, W)
-        loss = torch.mean(torch.pow((reconstructions - targets)[mask_full], 2))
+        loss = torch.mean(torch.pow((reconstructions - targets)[mask_full], 2))'''
         
         return (loss, outputs) if return_outputs else loss
 
@@ -100,12 +99,25 @@ def train_virtues(conf):
     num_sensors = len(conf.data.sensors) 
 
     # Define multimodal transform function that converts the data into the expected shape from albumentations
-    transforms = MultimodalTransforms(
+    train_transforms = MultimodalTransforms(
         transforms=A.Compose([
             Transpose([1, 2, 0]),  # Convert data to channel last (expected shape from albumentations)
             MultimodalNormalize(mean=statistics["mean"], std=statistics["std"]),
             A.RandomCrop(conf.data.crop_size, conf.data.crop_size),
             A.D4(),  # Random flipping and rotation
+            ToTensorV2(),  # Convert to tensor and back to channel first
+        ],
+            is_check_shapes=False,  # Not needed because of aligned data in TerraMesh
+            additional_targets={m: "image" for m in conf.data.modalities}  
+        ),
+        non_image_modalities=["__key__", "__url__"],  # Additional non-image keys
+    )
+
+    val_transforms = MultimodalTransforms(
+        transforms=A.Compose([
+            Transpose([1, 2, 0]),  # Convert data to channel last (expected shape from albumentations)
+            MultimodalNormalize(mean=statistics["mean"], std=statistics["std"]),
+            A.CenterCrop(conf.data.crop_size, conf.data.crop_size),
             ToTensorV2(),  # Convert to tensor and back to channel first
         ],
             is_check_shapes=False,  # Not needed because of aligned data in TerraMesh
@@ -134,8 +146,8 @@ def train_virtues(conf):
 
     random.shuffle(all_shard_names)
     
-    train_shard_names = all_shard_names[:6]
-    test_shard_names = all_shard_names[6:]
+    train_shard_names = all_shard_names[:7]
+    test_shard_names = all_shard_names[7:]
 
     train_urls = build_urls(conf.dataset_path, conf.data.modalities, train_shard_names)
     print("Train URLs:")
@@ -153,7 +165,7 @@ def train_virtues(conf):
         spectrum_specs=spectrum_specs,
         shuffle=conf.data.shuffle,  
         #split= "val",
-        transform=transforms,
+        transform=train_transforms,
         seed=conf.experiment.seed,
         batch_size=conf.training.batch_size,
         patch_size=conf.model.patch_size,
@@ -168,7 +180,7 @@ def train_virtues(conf):
         spectrum_specs=spectrum_specs,
         shuffle=False,  # No shuffling for validation/test
         #split= "val",
-        transform=transforms,
+        transform=val_transforms,
         seed=conf.experiment.seed,
         batch_size=conf.training.batch_size,
         patch_size=conf.model.patch_size,
@@ -239,9 +251,10 @@ def train_virtues(conf):
         max_steps=conf.training.max_steps if conf.training.max_steps > 0 else None,
         per_device_train_batch_size=1,  # We set batch size to 1 because we handle batching in the dataset with WebDataset
         per_device_eval_batch_size=1,
-        eval_strategy="epoch" if not DISABLE_EVAL else "no",
-        eval_steps=1, # epoch-wise evaluation
-        save_strategy="epoch",  # Save the model at the end of each epoch
+        eval_strategy="steps" if not DISABLE_EVAL else "no",
+        eval_steps=2000, # epoch-wise evaluation
+        save_strategy="steps",  # Save the model at the end of each epoch
+        save_steps=2000, # epoch-wise saving
         save_total_limit=1,  # Only keep the last model
         logging_dir=f'{conf.experiments_dir}/{conf.experiment.name}/logs',
         logging_strategy="steps",
