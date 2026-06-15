@@ -30,15 +30,13 @@ class TerraMeshDataset(IterableDataset):
         partial: bool = None,
         probs: list[int] = None,
         patch_size: int = 16,
-        masking_ratio : Tuple[float, float] = (0.6, 1.0),
-        crop_size: int = 224
+        masking_ratio : Tuple[float, float] = (0.6, 1.0)
     ):
         self.patch_size = patch_size
         self.masking_ratio = masking_ratio
         self.transform = transform
         self.modalities = modalities
-        self.nb_patch_length = int(crop_size // self.patch_size)  # Assuming all images are 512x512, this gives the number of patches along one dimension
-
+        
         # Init indices 
         self.projection_conversion = {i: spectrum_specs[i]['projection_idx'] for i in spectrum_specs}
         # create a dict of sensor_idx to the selected bands for that sensor

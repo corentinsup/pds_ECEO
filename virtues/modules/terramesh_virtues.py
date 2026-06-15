@@ -5,12 +5,14 @@ from loguru import logger
 from .layers.transformers_sdpa import MarkerAttentionEncoderBlock, ChannelAttentionEncoderBlock, FullAttentionEncoderBlock, PatchAttentionBlock
 from .layers.mask_utils_flashattention import build_self_attention_bias, build_self_attention_bias_channel_concat, SELF_ATTENTION_BIAS_CACHE
 from .layers.positional_embeddings import LearnablePositionalEmbedding2D, PositionalEmbedding2D, RotaryPositionalEmbedding2D
-from utils.model_utils import SpectrumAwareProjection
+from utils.model_utils import wavelength_embedding
 from einops import rearrange
 from itertools import groupby 
 from typing import Iterator, Optional, List, Tuple, Dict, Any, overload
 from dataclasses import dataclass
 from .layers.basic_modules import build_activation
+
+from utils.utils import POLARIZATIONS
 
 @dataclass
 class TerraMeshViTEncoderOutput:
@@ -30,11 +32,9 @@ class TerraMeshViTOutput:
 class TerraMeshViTEncoder(nn.Module):
     def __init__(
             self,
-            spectrum_specs: Dict[str, Any],
             prior_bias_embeddings: torch.Tensor,
             prior_bias_embedding_type: Optional[str],
             patch_size: int,
-            num_sensors: int,
             model_dim: int,
             feedforward_dim: int,
             encoder_pattern: str,
@@ -43,6 +43,9 @@ class TerraMeshViTEncoder(nn.Module):
             group_layers: float,
             norm_after_encoder_decoder: bool,
             positional_embedding_type: str,
+            wavelengths_per_proj: Optional[torch.Tensor] = None,
+            polarization_per_proj: Optional[torch.Tensor] = None,
+            log_wl_mean: Optional[float] = None,
             verbose: bool = True,
             prior_bias_embedding_fusion_type: str = 'add',
             **kwargs: Any
@@ -70,18 +73,45 @@ class TerraMeshViTEncoder(nn.Module):
             elif self.prior_bias_embedding_type == 'zero':
                 self.prior_bias_embeddings = nn.Parameter(torch.zeros_like(self.prior_bias_embeddings))
             elif self.prior_bias_embedding_type == 'wl':
-                self.spectrum_projection = SpectrumAwareProjection(
-                    spectrum_specs=spectrum_specs, 
-                    patch_size=self.patch_size, 
-                    embed_dim=self.model_dim
+                assert wavelengths_per_proj is not None and polarization_per_proj is not None and log_wl_mean is not None, \
+                    "wavelengths_per_proj, polarization_per_proj and log_wl_mean must be provided when prior_bias_embedding_type='wl'"
+                self.register_buffer('wavelengths_per_proj', wavelengths_per_proj, persistent=False)
+                self.register_buffer('polarization_per_proj', polarization_per_proj, persistent=False)
+                self.log_wl_mean = float(log_wl_mean)
+
+                self.wavelength_embedding_dim = 64
+                self.wavelength_projection = nn.Linear(self.wavelength_embedding_dim, self.model_dim)
+                self.wavelength_norm = nn.LayerNorm(self.wavelength_embedding_dim)
+                self.identity_scale = nn.Parameter(torch.tensor(0.3)) # learnable scaling factor for the wavelength embedding, initialized to a small value to prevent it from dominating early in training
+                self.polarization_embedding = nn.Embedding(len(POLARIZATIONS), self.wavelength_embedding_dim)
+            elif self.prior_bias_embedding_type == 'mlp':
+                assert wavelengths_per_proj is not None and polarization_per_proj is not None, \
+                    "wavelengths_per_proj and polarization_per_proj must be provided when prior_bias_embedding_type='wl'"
+                
+                self.register_buffer('wavelengths_per_proj', wavelengths_per_proj, persistent=False)
+                self.register_buffer('polarization_per_proj', polarization_per_proj, persistent=False)
+                
+                self.wavelength_embedding_dim = 64
+                
+                # Learned wavelength embedding: takes 1D log-wavelength → wavelength_embedding_dim vector
+                self.wavelength_mlp = nn.Sequential(
+                    nn.Linear(1, 128),
+                    nn.GELU(),
+                    #nn.LayerNorm(128),
+                    nn.Linear(128, 128),
+                    nn.GELU(),
+                    #nn.LayerNorm(128),
+                    nn.Linear(128, self.wavelength_embedding_dim),
                 )
-                # Creation of learnable embeddings for each sensor
-                self.num_sensors = num_sensors
-                self.sensor_embeddings = nn.Embedding(self.num_sensors, self.model_dim)
+                
+                self.polarization_embedding = nn.Embedding(len(POLARIZATIONS), self.wavelength_embedding_dim)
+                self.wavelength_norm = nn.LayerNorm(self.wavelength_embedding_dim)  # keep this for stability
+                self.wavelength_projection = nn.Linear(self.wavelength_embedding_dim, self.model_dim)
+                self.identity_scale = nn.Parameter(torch.tensor(0.3))
+            
             else:
                 self.register_buffer('prior_bias_embeddings', prior_bias_embeddings, persistent=False)
         
-
         if self.prior_bias_embedding_fusion_type == 'add':
             if self.verbose:
                 print("Using addition for prior_embedding fusion")
@@ -110,9 +140,9 @@ class TerraMeshViTEncoder(nn.Module):
         self.masked_token = nn.Parameter(torch.randn(self.model_dim) / self.model_dim**power) # type: ignore
 
         self.patch_encoder = nn.Linear(self.patch_size * self.patch_size, self.model_dim)
-        self.prior_embedding_encoder = nn.Linear(self.prior_bias_embeddings.shape[1], self.model_dim) if self.prior_bias_embedding_type != 'wl' else None 
-        self.prior_embedding_linear = nn.Linear(self.model_dim * 2, self.model_dim) if self.use_prior_embedding and self.prior_bias_embedding_type == 'wl' else None
+        self.prior_embedding_encoder = nn.Linear(self.prior_bias_embeddings.shape[1], self.model_dim) if self.prior_bias_embedding_type not in ('wl', 'mlp', 'empty') else None
 
+        
         # forming encoder
         enc_layers = []
         if group_layers:
@@ -171,11 +201,43 @@ class TerraMeshViTEncoder(nn.Module):
             nn.init.xavier_normal_(module.weight)
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
+    
+    def _wavelength_to_sinusoidal(self, wavelengths, polarization_indices):
+        """
+        Convert wavelengths to sinusoidal embeddings.
+        """
+        # Wavelength component
+        log_wl = torch.log(wavelengths.float())  # (N,)
+        log_wl_normalized = (log_wl - 8.0) / 4.0  # normalize log-wavelength to have a reasonable range for the MLP
+
+        wl_sin_emb = wavelength_embedding(log_wl_normalized, self.wavelength_embedding_dim) # (N, wl_dim)
+        
+        # Polarization component (sparse — mostly "none" for optical)
+        pol_emb = self.polarization_embedding(polarization_indices)  # (N, wl_dim)
+
+        # Add both embeddings and project to model_dim
+        wl_identity = wl_sin_emb + pol_emb  # (N, wl_dim)
+        wl_identity = self.wavelength_norm(wl_identity)  # (N, wl_dim)
+        wl_identity = self.wavelength_projection(wl_identity)  # (N, D)
+
+        return wl_identity  # (N, D)
+
+    def _wavelength_to_mlp(self, wavelengths, polarization_indices):
+        log_wl = torch.log(wavelengths.float()).unsqueeze(-1)  # (N, 1)
+        #log_wl_normalized = (log_wl - 8.0) / 4.0
+
+        wl_emb = self.wavelength_mlp(log_wl)  # (N, wl_dim)
+        pol_emb = self.polarization_embedding(polarization_indices)  # (N, wl_dim)
+
+        wl_identity = wl_emb + pol_emb
+        wl_identity = self.wavelength_norm(wl_identity)
+        wl_identity = self.wavelength_projection(wl_identity)  # (N, D)
+
+        return wl_identity  # (N, D)
 
     def forward_list(self, multiplex: List[torch.Tensor],
                      channel_ids: List[torch.Tensor],
                      multiplex_mask: Optional[List[torch.Tensor]] = None,
-                     sensor_ids: Optional[List[torch.Tensor]] = None,
                      projection_indices: Optional[torch.Tensor | List[torch.Tensor]] = None,
     ) -> TerraMeshViTEncoderOutput:
         
@@ -189,52 +251,7 @@ class TerraMeshViTEncoder(nn.Module):
         ) for mx_i in multiplex] # List[(C_i) H W (p q)]
         cat_multiplex = torch.cat(multiplex, dim=0)  # (sum_C) H W (p q)
         cat_channel_ids = torch.cat(channel_ids, dim=0)  # (sum_C)
-        sensor_embeds = None
-        
-        # Sensor Embeddings 
-        if sensor_ids is not None and self.use_prior_embedding:
-            cat_sensor_ids = torch.cat(sensor_ids, dim=0).long() # (sum_C)
-            # print("cat_sensor_ids:", cat_sensor_ids)
-            if torch.any(cat_sensor_ids < 0) or torch.any(cat_sensor_ids >= self.num_sensors):
-                bad_min = int(cat_sensor_ids.min().item())
-                bad_max = int(cat_sensor_ids.max().item())
-                raise ValueError(
-                    f"sensor_ids out of range for embedding: min={bad_min}, max={bad_max}, num_sensors={self.num_sensors}"
-                )
-            sensor_embeds = self.sensor_embeddings(cat_sensor_ids) # (sum_C) D
-            sensor_embeds = sensor_embeds.unsqueeze(1).expand(-1, H*W, -1).clone()  # (sum_C) (H W) D
 
-        # Wavelength-based Spectrum-aware Embeddings
-        if projection_indices is not None:
-            cat_proj_indices = torch.cat(projection_indices, dim=0)  # (sum_C) H W
-
-            # proj_idx is spatially constant per channel → take the value at the first spatial position for each channel
-            flat_proj_indices = cat_proj_indices[:, 0, 0].long()  # (sum_C_per_sample)
-            
-            # flat_proj_indices: (sum_C,) — broadcast spatially
-            spatial_proj = flat_proj_indices[:, None, None].expand(-1, H, W).clone()  # (sum_C, H, W)
-
-            # Now apply spectrum projection patch by patch
-            # cat_multiplex: (sum_C, H, W, p*q)
-            # we need output: (sum_C, H, W, D)
-            patch_embeds = None
-            
-            for proj_idx in torch.unique(spatial_proj):
-                mask = (spatial_proj == proj_idx)                    # (sum_C, H, W) bool
-                patches = cat_multiplex[mask]                        # (N_match, P²)
-                proj_out = self.spectrum_projection(patches, proj_idx.item())
-                if patch_embeds is None:
-                    patch_embeds = torch.zeros(
-                        (cat_multiplex.shape[0], H, W, self.model_dim),
-                        device=cat_multiplex.device,
-                        dtype=proj_out.dtype,
-                    )
-                patch_embeds[mask] = proj_out.to(dtype=patch_embeds.dtype)
-
-            cat_multiplex = patch_embeds  # (sum_C, H, W, D)
-        else:
-            # Fallback: single generic linear projection
-            cat_multiplex = self.patch_encoder(cat_multiplex)  # (sum_C, H, W, D)
 
         if multiplex_mask is not None:
             cat_multiplex_mask = torch.cat(multiplex_mask, dim=0)  # (sum_C) H W
@@ -255,6 +272,9 @@ class TerraMeshViTEncoder(nn.Module):
         pos_multiplex = pos_multiplex.expand(sum_C, H, W, 2)
         pos_multiplex = rearrange(pos_multiplex, 'C H W d -> C (H W) d')
 
+        cat_multiplex = self.patch_encoder(cat_multiplex)  # (sum_C, H, W, D)
+
+
         if multiplex_mask is not None:
            cat_multiplex = torch.where(cat_multiplex_mask.unsqueeze(-1),
                                        self.masked_token.expand(cat_multiplex.shape),
@@ -263,21 +283,32 @@ class TerraMeshViTEncoder(nn.Module):
 
         cat_multiplex = rearrange(cat_multiplex, "C H W D -> C (H W) D")
 
-        # Concatenate sensor embeddings with cat_multiplex if sensor embeddings are used
-        '''if sensor_embeds is not None:
-            if self.prior_bias_embedding_fusion_type == 'concatenate':
-                cat_multiplex = torch.cat([cat_multiplex, sensor_embeds], dim=-1)  # (sum_C) (H W) 2*D
-                cat_multiplex = self.prior_embedding_linear(cat_multiplex)  # (sum_C) (H W) D
-            else:
-                cat_multiplex = cat_multiplex + sensor_embeds'''
 
-        if self.prior_bias_embedding_type != 'wl':
+        if self.prior_bias_embedding_type in ('wl', 'mlp'):
+            if isinstance(projection_indices, list):
+                cat_proj_indices = torch.cat(projection_indices, dim=0)  # (sum_C, Hg, Wg)
+            else:
+                cat_proj_indices = projection_indices
+            flat_proj_indices = cat_proj_indices[:, 0, 0].long()         # (sum_C,)
+            wavelengths = self.wavelengths_per_proj[flat_proj_indices]      # (sum_C,)
+            polarization_idx = self.polarization_per_proj[flat_proj_indices]  # (sum_C,)
+
+            if self.prior_bias_embedding_type == 'wl':
+                wl_raw = self._wavelength_to_sinusoidal(wavelengths, polarization_idx)  # (sum_C, D)
+            else:
+                wl_raw = self._wavelength_to_mlp(wavelengths, polarization_idx)  # (sum_C, D)
+
+            wl_embed = wl_raw.unsqueeze(1).expand(-1, H * W, -1)  # (sum_C, H*W, D)
+            cat_multiplex = cat_multiplex + self.identity_scale * wl_embed  # (sum_C, H*W, D)
+
+        elif self.prior_bias_embedding_type != 'empty':
             prior_embeddings = self.prior_bias_embeddings[cat_channel_ids]  # (sum_C) D
             prior_embeddings = self.prior_embedding_encoder(prior_embeddings)  # (sum_C) model_dim
             prior_embeddings = prior_embeddings.unsqueeze(1).expand(*cat_multiplex.shape)  # (sum_C) (H W) model_dim
             if self.prior_bias_embedding_fusion_type == 'add':
                 cat_multiplex = cat_multiplex + prior_embeddings
-        
+
+
         cat_multiplex = torch.split(cat_multiplex, multiplex_channels_per_sample, dim=0)  # List[(C_i) (H W) D]
         if self.num_registers > 0:
             x = [
@@ -505,7 +536,7 @@ class TerraMeshViTDecoder(nn.Module):
             
 class TerraMeshViT(nn.Module):
 
-    VALID_PRIOR_BIAS_EMBEDDING_TYPES = {'zero', 'learnable', 'wl', 'dem', 'one_hot', 'empty'}
+    VALID_PRIOR_BIAS_EMBEDDING_TYPES = {'zero', 'learnable', 'wl', 'dem', 'one_hot', 'empty', 'mlp'}
     VALID_PATTERN_BLOCKS = {'h', 'v', 'f', 'p'}
     VALID_PRIOR_BIAS_EMBEDDING_FUSION_TYPES = {'add', 'cross-attn', 'concatenate'}
     VALID_POSITIONAL_EMBEDDING_TYPES = {'learnable', 'absolute_beginning', 'rope'}
@@ -612,7 +643,6 @@ class TerraMeshViT(nn.Module):
             multiplex,
             channel_ids,
             multiplex_mask=multiplex_mask,
-            sensor_ids=sensor_ids,
             projection_indices=projection_indices,
         )
         decoder_output = self.decoder.forward_list(

@@ -11,8 +11,9 @@ from transformers import Trainer, TrainingArguments
 
 from local_datasets.terramesh import Transpose, MultimodalTransforms, MultimodalNormalize, statistics
 from local_datasets.terramesh_dataset import TerraMeshDataset
-from utils.utils import is_rank0, set_seed, to_device, load_specs, build_urls
-from virtues.modules.multiplex_virtues import TerraMeshViT
+from utils.utils import is_rank0, set_seed, to_device, load_specs, build_urls, compute_wavelength_stats
+#from virtues.modules.multiplex_virtues import TerraMeshViT
+from virtues.modules.terramesh_virtues import TerraMeshViT
 
 class TerraMeshViTTrainer(Trainer):
 
@@ -20,9 +21,9 @@ class TerraMeshViTTrainer(Trainer):
         super().__init__(*args, **kwargs)
         self.conf = conf
 
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+    def forward_and_losses(self, model, inputs):
         multiplex, channel_ids, multiplex_mask, sensor_ids, projection_indices = inputs
-        
+
         multiplex = to_device(multiplex, 'cuda') # list of tensors of shape C_i x H x W
         channel_ids = to_device(channel_ids, 'cuda') # list of tensors of shape C_i
         multiplex_mask = to_device(multiplex_mask, 'cuda') # list of tensors of shape C_i x H//patch_size x W//patch_size
@@ -36,48 +37,75 @@ class TerraMeshViTTrainer(Trainer):
                             sensor_ids=sensor_ids,
                             projection_indices=projection_indices
                         )
-        
-        reconstructions = outputs.decoded_multiplex # list of tensors of shape C_i x H x W
-        reconstructions = torch.concat(reconstructions, dim=0) # sum(C_i) x H x W
-        targets = torch.concat(multiplex, dim=0) # sum(C_i) x H x W
-        
-        loss = torch.mean(torch.pow(reconstructions - targets, 2))
-        # compute loss only on masked patches
 
-        '''mask = torch.concat(multiplex_mask, dim=0)  # (sum_C, H//p, W//p)
+        reconstructions = torch.concat(outputs.decoded_multiplex, dim=0) # sum(C_i) x H x W
+        targets = torch.concat(multiplex, dim=0) # sum(C_i) x H x W
+
+        mask = torch.concat(multiplex_mask, dim=0)  # (sum_C, H//p, W//p)
         p = self.conf.model.patch_size
-        mask_full = mask.repeat_interleave(p, dim=-2).repeat_interleave(p, dim=-1)  # (sum_C, H, W)
-        loss = torch.mean(torch.pow((reconstructions - targets)[mask_full], 2))'''
+        mask_full = mask.repeat_interleave(p, dim=-2).repeat_interleave(p, dim=-1).bool()  # (sum_C, H, W)
+
+        sq_err = torch.pow(reconstructions - targets, 2)
+        loss_all = torch.mean(sq_err)
+        loss_masked = torch.mean(sq_err[mask_full]) if mask_full.any() else torch.zeros((), device=sq_err.device)
+        loss_visible = torch.mean(sq_err[~mask_full]) if (~mask_full).any() else torch.zeros((), device=sq_err.device)
+
+        return outputs, loss_all, loss_masked, loss_visible
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        outputs, loss_all, loss_masked, loss_visible = self.forward_and_losses(model, inputs)
         
-        return (loss, outputs) if return_outputs else loss
+        if WANDB_AVAILABLE and is_rank0() and self.state.global_step % self.args.logging_steps == 0:
+            unwrapped = model.module if hasattr(model, "module") else model
+            
+            log_dict = {
+                "train/loss_all": loss_all.item(),
+                "train/loss_masked": loss_masked.item(),
+                "train/loss_visible": loss_visible.item(),
+                "train/identity_scale": unwrapped.encoder.identity_scale.item(),
+            }
+
+            wandb.log(log_dict, step=self.state.global_step)
+        
+        return (loss_all, outputs) if return_outputs else loss_all
 
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix: str = "eval"):
         if DISABLE_EVAL:
             return {}
         else:
             eval_dl = self.get_eval_dataloader()
-            sum = 0.0
+            sum_all = 0.0
+            sum_masked = 0.0
+            sum_visible = 0.0
             terms = 0
             for batch in eval_dl:
                 with torch.no_grad():
-                    loss = self.compute_loss(self.model, batch)
-                    sum += loss.item()
+                    _, loss_all, loss_masked, loss_visible = self.forward_and_losses(self.model, batch)
+                    sum_all += loss_all.item()
+                    sum_masked += loss_masked.item()
+                    sum_visible += loss_visible.item()
                     terms += 1
-            avg = sum / terms
+            avg_all = sum_all / terms
+            avg_masked = sum_masked / terms
+            avg_visible = sum_visible / terms
+
             world_size = int(os.environ.get('WORLD_SIZE', '1'))
             if world_size > 1:
-                avg_tensor = torch.tensor(avg).cuda()
-                torch.distributed.all_reduce(avg_tensor, op=torch.distributed.ReduceOp.SUM)
-                avg = (avg_tensor / world_size).item()
+                t = torch.tensor([avg_all, avg_masked, avg_visible]).cuda()
+                torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+                t = t / world_size
+                avg_all, avg_masked, avg_visible = t[0].item(), t[1].item(), t[2].item()
 
             results = {
                 "epoch" : self.state.epoch,
-                "test_loss" : avg,
+                "test_loss" : avg_all,
+                "test_loss_masked" : avg_masked,
+                "test_loss_visible" : avg_visible,
             }
 
             if WANDB_AVAILABLE and is_rank0():
                 wandb.log(results)
-            
+
             return results
         
 
@@ -96,8 +124,11 @@ def train_virtues(conf):
     # Apply remap in-place (or on a copied dict)
     for k in sensor_specs:
         sensor_specs[k]["sensor_idx"] = old_to_new[sensor_specs[k]["sensor_idx"]]
-    num_sensors = len(conf.data.sensors) 
-
+    #num_sensors = len(conf.data.sensors) 
+    
+    # Central wavelength per projection idx
+    wavelengths_per_proj, polarization_per_proj, log_wl_mean = compute_wavelength_stats(sensor_specs, spectrum_specs)
+    
     # Define multimodal transform function that converts the data into the expected shape from albumentations
     train_transforms = MultimodalTransforms(
         transforms=A.Compose([
@@ -144,10 +175,8 @@ def train_virtues(conf):
         print(f"DEBUG: First modality: {conf.data.modalities[0]}")
         raise ValueError(f"No majortom tar files found at {os.path.join(conf.dataset_path, conf.data.modalities[0])}")
 
-    random.shuffle(all_shard_names)
-    
     train_shard_names = all_shard_names[:7]
-    test_shard_names = all_shard_names[7:]
+    test_shard_names = all_shard_names[7:8]
 
     train_urls = build_urls(conf.dataset_path, conf.data.modalities, train_shard_names)
     print("Train URLs:")
@@ -225,9 +254,12 @@ def train_virtues(conf):
     model = TerraMeshViT(
         use_default_config = False,
         custom_config = None,
-        spectrum_specs=spectrum_specs,
-        num_sensors=num_sensors,
-        prior_bias_embedding_type='wl',
+        #spectrum_specs=spectrum_specs,
+        wavelengths_per_proj=wavelengths_per_proj,
+        polarization_per_proj=polarization_per_proj,
+        log_wl_mean=log_wl_mean,
+        #num_sensors=num_sensors,
+        prior_bias_embedding_type='mlp',
         prior_bias_embedding_fusion_type='concatenate',
         patch_size=conf.model.patch_size,
         model_dim=conf.model.model_dim,
@@ -252,10 +284,10 @@ def train_virtues(conf):
         per_device_train_batch_size=1,  # We set batch size to 1 because we handle batching in the dataset with WebDataset
         per_device_eval_batch_size=1,
         eval_strategy="steps" if not DISABLE_EVAL else "no",
-        eval_steps=2000, # epoch-wise evaluation
+        eval_steps=8960, # epoch-wise evaluation
         save_strategy="steps",  # Save the model at the end of each epoch
-        save_steps=2000, # epoch-wise saving
-        save_total_limit=1,  # Only keep the last model
+        save_steps=8960, # epoch-wise saving
+        save_total_limit=3,  # Only keep the last model
         logging_dir=f'{conf.experiments_dir}/{conf.experiment.name}/logs',
         logging_strategy="steps",
         logging_steps=100,

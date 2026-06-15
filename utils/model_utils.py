@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import math
 
 class SpectrumRangeProjection(nn.Module):
     """Patch Embedding of a sensor without patchify"""
@@ -83,114 +84,41 @@ class SpectrumAwareProjection(nn.Module):
             projection_idx = int(projection_idx.item())
         return self.spectrum_embeds[int(projection_idx)](x)
 
-# --------------------------------------------------------
-# 2D sine-cosine position embedding
-# References:
-# Transformer: https://github.com/tensorflow/models/blob/master/official/nlp/transformer/model_utils.py
-# MoCo v3: https://github.com/facebookresearch/moco-v3
-# --------------------------------------------------------
-def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
+# ----- UTIL TO COMPUTE WAWELENGTHS EMBEDDINGS -----
+
+def wavelength_embedding(wavelengths, d_model):
     """
-    grid_size: int of the grid height and width
-    return:
-    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
+    Sinusoidal encoding of log-wavelength.
+    
+    Args:
+        wavelengths: tensor of shape (N,) with wavelengths in logscale
+        d_model: embedding dimension (must be even)
+        base: frequency base (analogous to 10000 in standard positional encodings)
+    
+    Returns:
+        Tensor of shape (N, d_model)
     """
-    grid_h = np.arange(grid_size, dtype=float)
-    grid_w = np.arange(grid_size, dtype=float)
-    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
-    grid = np.stack(grid, axis=0)
+    if d_model % 2 != 0:
+        raise ValueError("d_model must be even for wavelength embedding")
+    
+    # Frequency schedule
+    half_d = d_model // 2
+    '''min_freq = 2 * math.pi / 12.0   # ~0.52 — slow variation across full range
+    max_freq = 2 * math.pi / 0.5   # ~62.8 — fast variation between adjacent bands
+    
+    # Geometric progression from min_freq to max_freq
+    div_term = min_freq * (max_freq / min_freq) ** (
+        torch.arange(half_d, device=wavelengths.device, dtype=torch.float32) / (half_d - 1)
+    )'''
+   
+    div_term = torch.exp(torch.arange(0, half_d, device=wavelengths.device, dtype=torch.float32) * -(math.log(10000.0) / half_d))
+    
+    # Compute angles
+    angles = wavelengths.unsqueeze(-1) * div_term 
 
-    grid = grid.reshape([2, 1, grid_size, grid_size])
-    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
-    if cls_token:
-        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
-    return pos_embed
+    # Build embeddings
+    pe = torch.zeros(wavelengths.shape[0], d_model, device=wavelengths.device)
+    pe[:, 0::2] = torch.sin(angles)
+    pe[:, 1::2] = torch.cos(angles)
 
-
-def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
-    assert embed_dim % 2 == 0
-
-    # use half of dimensions to encode grid_h
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
-
-    emb = np.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
-    return emb
-
-
-def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-    """
-    embed_dim: output dimension for each position
-    pos: a list of positions to be encoded: size (M,)
-    out: (M, D)
-    """
-    assert embed_dim % 2 == 0
-    omega = np.arange(embed_dim // 2, dtype=float)
-    omega /= embed_dim / 2.0
-    omega = 1.0 / 10000**omega  # (D/2,)
-
-    pos = pos.reshape(-1)  # (M,)
-    out = np.einsum("m,d->md", pos, omega)  # (M, D/2), outer product
-
-    emb_sin = np.sin(out)  # (M, D/2)
-    emb_cos = np.cos(out)  # (M, D/2)
-
-    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
-    return emb
-
-# --------------------------------------------------------
-# Interpolate position embeddings for high-resolution
-# References:
-# DeiT: https://github.com/facebookresearch/deit
-# --------------------------------------------------------
-def interpolate_pos_embed(model, checkpoint_model, num_extra_tokens=1):
-    if "pos_embed" in checkpoint_model:
-        pos_embed_checkpoint = checkpoint_model["pos_embed"]
-        embedding_size = pos_embed_checkpoint.shape[-1]
-        num_patches = model.pos_embed.shape[-2] - num_extra_tokens
-
-        # height (== width) for the checkpoint position embedding
-        orig_size = int((pos_embed_checkpoint.shape[-2] - num_extra_tokens) ** 0.5)
-        # height (== width) for the new position embedding
-        new_size = int(num_patches**0.5)
-        # class_token and dist_token are kept unchanged
-        if orig_size != new_size:
-            print(
-                "Position interpolate from %dx%d to %dx%d"
-                % (orig_size, orig_size, new_size, new_size)
-            )
-            extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
-            # only the position tokens are interpolated
-            pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
-            pos_tokens = pos_tokens.reshape(
-                -1, orig_size, orig_size, embedding_size
-            ).permute(0, 3, 1, 2)
-            pos_tokens = torch.nn.functional.interpolate(
-                pos_tokens,
-                size=(new_size, new_size),
-                mode="bicubic",
-                align_corners=False,
-            )
-            pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
-            new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
-            checkpoint_model["pos_embed"] = new_pos_embed
-
-def tensor_patchify(imgs, patch_size):
-    """
-    imgs: (N, 3, H, W)
-    x: (N, L, patch_size**2 *3)
-    """
-    p = patch_size
-    assert imgs.shape[2] == imgs.shape[3] and imgs.shape[2] % p == 0
-
-    h = w = imgs.shape[2] // p
-    x = imgs.reshape(shape=(imgs.shape[0], imgs.shape[1], h, p, w, p))
-    x = torch.einsum('nchpwq->nhwpqc', x)
-    x = x.reshape(shape=(imgs.shape[0], h, w, p, p, imgs.shape[1])).permute(0,1,2,5,3,4)
-    return x
-
-def apply_label_mixup_fn(batch, mixup_fn, patch_size):
-    imgs, img_projection_indices, targets = batch
-    imgs, targets = mixup_fn(imgs, targets)
-    img_patches = tensor_patchify(imgs, patch_size)
-    return (img_patches, img_projection_indices, targets)
+    return pe

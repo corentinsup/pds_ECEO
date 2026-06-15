@@ -6,7 +6,7 @@ spectrum_specs_path: 'pds_ECEO/spectrum/electromagnetic_spectrum.yaml' # Path to
 experiments_dir: 'experiments/' # Outputs will be written to {experiments_dir}/{experiment.name}/
 
 experiment:
-  name: final_train_tot_loss_eval # Initialize with the name of the run
+  name: mlp_full_mask # Initialize with the name of the run
   seed: 42
   gpu: 0 # Set to None to use default GPU selection, or specify a GPU index (e.g., 0, 1, etc.)
   wandb_entity: corentin-suply-epfl
@@ -15,7 +15,7 @@ experiment:
 
 training:
   epochs: 10
-  max_steps: 84780 # 75360 = steps_per_epoch * epochs, where steps_per_epoch = train_images / batch_size = 60288/8 = 7536
+  max_steps: 89600 # 71 680 images for training, # of images / batch_size = 8 960 * 10 epochs = 89600 steps
   batch_size: 2
   fp16: True
   bf16: False
@@ -43,7 +43,7 @@ model:
 
 data:
   crop_size: 224
-  masking_ratio: [0.6, 0.8]
+  masking_ratio: [0.6, 1.0]
   modalities:
   - "S2L2A"
   #- "S2L1C"

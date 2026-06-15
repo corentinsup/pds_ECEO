@@ -1,9 +1,12 @@
 import os
+import math
 import torch
 import numpy as np
 import random
 import yaml
 from typing import Tuple
+
+POLARIZATIONS = {'none': 0, 'VV': 1, 'VH': 2}
 
 def is_rank0():
     """
@@ -39,6 +42,56 @@ def load_specs(sensors_specs_path : str, spectrum_specs_path : str):
     with open(spectrum_specs_path) as f:
         spectrum_specs = yaml.safe_load(f.read())
     return (sensors_specs, spectrum_specs)
+
+def compute_wavelength_stats(sensor_specs: dict, spectrum_specs: dict):
+    """
+    Build per-projection wavelength/polarization tensors and the mean of
+    log(central_wavelength) over the bands actually used by ``sensor_specs``.
+
+    Pass the already-filtered ``sensor_specs`` (i.e. after restricting to the
+    sensors selected in the config). Polarization is read from the ``name``
+    field of each spectrum entry (e.g. 'VV', 'VH'); anything not matching a
+    known polarization is treated as 'none'.
+
+    Returns
+    -------
+    wavelengths_per_proj : torch.FloatTensor of shape (max_proj_idx + 1,)
+        Central wavelength (nm) per projection_idx; unused slots are 0.
+    polarization_per_proj : torch.LongTensor of shape (max_proj_idx + 1,)
+        Polarization index per projection_idx (see ``POLARIZATIONS``).
+    log_wl_mean : float
+        Mean of log(central_wavelength) over the *used* bands only.
+    """
+    used_band_names = set()
+    for sensor in sensor_specs.values():
+        bands = sensor['bands']
+        for i in sensor['selected_bands']:
+            used_band_names.add(bands[int(i)])
+
+    entries = []  # (proj_idx, central_wl, pol_idx)
+    for band_name, spec in spectrum_specs.items():
+        if band_name not in used_band_names:
+            continue
+        proj_idx = int(spec['projection_idx'])
+        if proj_idx == -1:
+            continue
+        central_wl = 0.5 * (float(spec['min_wavelength']) + float(spec['max_wavelength']))
+        pol_idx = POLARIZATIONS.get(spec.get('name', ''), POLARIZATIONS['none'])
+        entries.append((proj_idx, central_wl, pol_idx))
+
+    if not entries:
+        raise ValueError("compute_wavelength_stats: no used bands found in spectrum_specs")
+
+    max_proj = max(e[0] for e in entries)
+    wavelengths_per_proj = torch.zeros(max_proj + 1, dtype=torch.float32)
+    polarization_per_proj = torch.zeros(max_proj + 1, dtype=torch.long)
+    for proj_idx, central_wl, pol_idx in entries:
+        wavelengths_per_proj[proj_idx] = central_wl
+        polarization_per_proj[proj_idx] = pol_idx
+
+    log_wl_mean = float(np.mean([math.log(e[1]) for e in entries]))
+    return wavelengths_per_proj, polarization_per_proj, log_wl_mean
+
 
 def load_marker_embeddings(embedding_dir : str):
     """
@@ -141,3 +194,4 @@ def build_urls(base_path, modalities, shard_names):
         os.path.join(base_path, f"[{modality_str}]", shard)
         for shard in shard_names
     ]
+

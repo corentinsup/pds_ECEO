@@ -3,6 +3,13 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Images & PDFs
+*.png
+*.pdf
+
+# Weights & Biases
+wandb/
+
 # C extensions
 *.so
 

@@ -636,7 +636,7 @@ class CrossAttentionBlock(nn.Module):
 
         # Block-diagonal keep-mask: query in sample b can only attend to keys in sample b.
         # Q and KV have the same length here, so this is the same square mask we use elsewhere.
-        keep_mask = _block_diagonal_keep_mask(seg_lens)  # (N, N) bool
+        keep_mask = _block_diagonal_keep_mask(q_lens)  # (N, N) bool
  
         ca = self.attention_module(
             query=_x_attn,
